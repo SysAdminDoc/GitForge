@@ -7,6 +7,25 @@ Clone, sync, backup, search, and manage all your GitHub repos from one tool.
 import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch
 from pathlib import Path
 
+
+# codex-branding:start
+def _branding_icon_path() -> Path:
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / "icon.png")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "icon.png")
+    current = Path(__file__).resolve()
+    candidates.extend([current.parent / "icon.png", current.parent.parent / "icon.png", current.parent.parent.parent / "icon.png"])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("icon.png")
+# codex-branding:end
+
+
 def _bootstrap():
     """Auto-install dependencies before any other imports."""
     if sys.version_info < (3, 8):
@@ -43,7 +62,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QComboBox, QSpinBox, QToolButton, QStatusBar
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QFont, QColor, QTextCursor
+from PyQt6.QtGui import QFont, QColor, QTextCursor, QIcon
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CRASH LOGGING
@@ -2666,12 +2685,15 @@ class MainWindow(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
     app = QApplication(sys.argv)
+    branding_icon = QIcon(str(_branding_icon_path()))
+    app.setWindowIcon(branding_icon)
     app.setStyle("Fusion")
     app.setStyleSheet(DARK_STYLE)
     font = app.font()
     font.setPointSize(10)
     app.setFont(font)
     window = MainWindow()
+    window.setWindowIcon(branding_icon)
     window.show()
     sys.exit(app.exec())
 
