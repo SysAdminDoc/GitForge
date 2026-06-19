@@ -4,7 +4,7 @@ GitForge - Complete GitHub Repository Manager
 Clone, sync, backup, search, and manage all your GitHub repos from one tool.
 """
 
-import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch
+import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch, csv, io
 from pathlib import Path
 
 
@@ -152,12 +152,14 @@ def find_git():
 # GITHUB API HELPER
 # ═══════════════════════════════════════════════════════════════════════════════
 class GitHubAPI:
-    """Centralized GitHub API access."""
+    """Centralized GitHub API access with rate-limit awareness."""
     BASE = "https://api.github.com"
 
     def __init__(self, username="", token=""):
         self.username = username
         self.token = token
+        self._rate_remaining = None
+        self._rate_reset = None
 
     @property
     def headers(self):
@@ -166,21 +168,51 @@ class GitHubAPI:
             h["Authorization"] = f"token {self.token}"
         return h
 
-    def get(self, path, params=None):
+    def _update_rate_info(self, resp):
+        """Track rate limit from response headers."""
+        self._rate_remaining = int(resp.headers.get("X-RateLimit-Remaining", -1))
+        self._rate_reset = int(resp.headers.get("X-RateLimit-Reset", 0))
+
+    def _wait_if_rate_limited(self, log_cb=None):
+        """If near rate limit, wait until reset."""
+        if self._rate_remaining is not None and self._rate_remaining <= 5:
+            wait = max(0, self._rate_reset - int(time.time())) + 1
+            if wait > 0 and wait < 900:  # cap at 15 min
+                if log_cb:
+                    log_cb(f"Rate limit near ({self._rate_remaining} left), waiting {wait}s...")
+                time.sleep(wait)
+
+    def get(self, path, params=None, log_cb=None):
+        self._wait_if_rate_limited(log_cb)
         resp = requests.get(f"{self.BASE}{path}", headers=self.headers, params=params, timeout=30)
+        self._update_rate_info(resp)
         return resp
 
-    def patch(self, path, data):
+    def patch(self, path, data, log_cb=None):
+        self._wait_if_rate_limited(log_cb)
         resp = requests.patch(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
+        self._update_rate_info(resp)
         return resp
 
-    def post(self, path, data):
+    def post(self, path, data, log_cb=None):
+        self._wait_if_rate_limited(log_cb)
         resp = requests.post(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
+        self._update_rate_info(resp)
         return resp
 
-    def delete(self, path):
+    def delete(self, path, log_cb=None):
+        self._wait_if_rate_limited(log_cb)
         resp = requests.delete(f"{self.BASE}{path}", headers=self.headers, timeout=30)
+        self._update_rate_info(resp)
         return resp
+
+    @property
+    def rate_limit_info(self):
+        """Return current rate limit status string."""
+        if self._rate_remaining is None:
+            return "unknown"
+        reset_dt = datetime.fromtimestamp(self._rate_reset).strftime("%H:%M:%S") if self._rate_reset else "?"
+        return f"{self._rate_remaining} remaining (resets {reset_dt})"
 
     def fetch_all_repos(self, log_cb=None):
         repos = []
@@ -402,6 +434,92 @@ def format_size(size_kb):
     return f"{size_kb} KB"
 
 
+def export_table_to_csv(table, parent_widget, default_name="export.csv"):
+    """Export a QTableWidget to CSV via save dialog."""
+    path, _ = QFileDialog.getSaveFileName(
+        parent_widget, "Export to CSV", default_name,
+        "CSV Files (*.csv);;All Files (*)")
+    if not path:
+        return False
+    try:
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Header
+            headers = []
+            for col in range(table.columnCount()):
+                h = table.horizontalHeaderItem(col)
+                headers.append(h.text() if h else f"Col{col}")
+            writer.writerow(headers)
+            # Rows
+            for row in range(table.rowCount()):
+                row_data = []
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    if item:
+                        row_data.append(item.text())
+                    else:
+                        # Check for checkbox widget
+                        chk = get_table_checkbox(table, row, col)
+                        if chk is not None:
+                            row_data.append("Yes" if chk.isChecked() else "No")
+                        else:
+                            row_data.append("")
+                writer.writerow(row_data)
+        return True
+    except Exception as e:
+        QMessageBox.critical(parent_widget, "Export Error", f"Failed to export: {e}")
+        return False
+
+
+def export_table_to_markdown(table, parent_widget, default_name="export.md"):
+    """Export a QTableWidget to Markdown via save dialog."""
+    path, _ = QFileDialog.getSaveFileName(
+        parent_widget, "Export to Markdown", default_name,
+        "Markdown Files (*.md);;All Files (*)")
+    if not path:
+        return False
+    try:
+        headers = []
+        for col in range(table.columnCount()):
+            h = table.horizontalHeaderItem(col)
+            headers.append(h.text() if h else f"Col{col}")
+
+        lines = []
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+        for row in range(table.rowCount()):
+            cells = []
+            for col in range(table.columnCount()):
+                item = table.item(row, col)
+                if item:
+                    cells.append(item.text().replace("|", "\\|"))
+                else:
+                    chk = get_table_checkbox(table, row, col)
+                    if chk is not None:
+                        cells.append("Yes" if chk.isChecked() else "No")
+                    else:
+                        cells.append("")
+            lines.append("| " + " | ".join(cells) + " |")
+
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines) + "\n")
+        return True
+    except Exception as e:
+        QMessageBox.critical(parent_widget, "Export Error", f"Failed to export: {e}")
+        return False
+
+
+def snapshot_repo_metadata(repos, dest_dir):
+    """Save repo metadata JSON before bulk API changes for rollback."""
+    os.makedirs(dest_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(dest_dir, f"metadata_snapshot_{ts}.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(repos, f, indent=2, default=str)
+    return path
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB: CLONE
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -476,6 +594,12 @@ class CloneTab(QWidget):
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel)
         actions.addWidget(self.cancel_btn)
+
+        export_csv_btn = QPushButton("Export CSV")
+        export_csv_btn.setProperty("class", "secondary")
+        export_csv_btn.setFixedWidth(90)
+        export_csv_btn.clicked.connect(lambda: export_table_to_csv(self.table, self, "clone_repos.csv"))
+        actions.addWidget(export_csv_btn)
         layout.addLayout(actions)
 
     def log(self, msg):
@@ -714,6 +838,12 @@ class SyncTab(QWidget):
         gc_btn.setProperty("class", "warning")
         gc_btn.clicked.connect(lambda: self._bulk_action("gc"))
         actions.addWidget(gc_btn)
+
+        export_csv_btn = QPushButton("Export CSV")
+        export_csv_btn.setProperty("class", "secondary")
+        export_csv_btn.setFixedWidth(90)
+        export_csv_btn.clicked.connect(lambda: export_table_to_csv(self.table, self, "sync_status.csv"))
+        actions.addWidget(export_csv_btn)
         layout.addLayout(actions)
 
     def log(self, msg):
@@ -1201,6 +1331,19 @@ class SearchTab(QWidget):
         row.addWidget(self.search_btn)
         layout.addLayout(row)
 
+        # History search
+        hist_row = QHBoxLayout()
+        hist_row.addWidget(QLabel("History Search:"))
+        self.hist_query = QLineEdit()
+        self.hist_query.setPlaceholderText("Search git history (git log -G)...")
+        self.hist_query.returnPressed.connect(self.do_history_search)
+        hist_row.addWidget(self.hist_query, 1)
+        self.hist_btn = QPushButton("Search History")
+        self.hist_btn.setProperty("class", "secondary")
+        self.hist_btn.clicked.connect(self.do_history_search)
+        hist_row.addWidget(self.hist_btn)
+        layout.addLayout(hist_row)
+
         # Quick actions
         quick = QHBoxLayout()
         dirty_btn = QPushButton("Find Dirty Repos")
@@ -1217,7 +1360,23 @@ class SearchTab(QWidget):
         large_btn.setProperty("class", "secondary")
         large_btn.clicked.connect(self.find_large_files)
         quick.addWidget(large_btn)
+
+        license_btn = QPushButton("License Audit")
+        license_btn.setProperty("class", "secondary")
+        license_btn.clicked.connect(self.license_audit)
+        quick.addWidget(license_btn)
+
+        abandoned_btn = QPushButton("Abandoned Repos")
+        abandoned_btn.setProperty("class", "secondary")
+        abandoned_btn.clicked.connect(self.find_abandoned)
+        quick.addWidget(abandoned_btn)
+
         quick.addStretch()
+
+        export_btn = QPushButton("Export Results")
+        export_btn.setProperty("class", "secondary")
+        export_btn.clicked.connect(self._export_results)
+        quick.addWidget(export_btn)
         layout.addLayout(quick)
 
         # Results
@@ -1397,6 +1556,195 @@ class SearchTab(QWidget):
         self.worker.error.connect(lambda e: self.log(f"ERROR: {e}"))
         self.worker.start()
 
+    def do_history_search(self):
+        """Cross-repo regex grep on git history via git log -G."""
+        query = self.hist_query.text().strip()
+        if not query:
+            return
+        src = self.app.repos_dir
+        git = self.app.git_exe
+        if not src or not git:
+            return
+
+        self.results.clear()
+        self.hist_btn.setEnabled(False)
+        self.hist_btn.setText("Searching...")
+
+        def do_grep_history(progress_cb, log_cb):
+            entries = sorted([d for d in os.listdir(src)
+                             if os.path.isdir(os.path.join(src, d, ".git"))])
+            total_matches = 0
+            repos_with_matches = 0
+
+            for i, name in enumerate(entries):
+                progress_cb(i, len(entries))
+                rpath = os.path.join(src, name)
+                cmd = [git, "-C", rpath, "log", "-G", query,
+                       "--oneline", "--all", "--max-count=20",
+                       "--format=%h %s"]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    if r.returncode == 0 and r.stdout.strip():
+                        lines = r.stdout.strip().split("\n")
+                        total_matches += len(lines)
+                        repos_with_matches += 1
+                        self.results.appendPlainText(f"\n=== {name} ({len(lines)} commits) ===")
+                        for line in lines[:20]:
+                            self.results.appendPlainText(f"  {line}")
+                        if len(lines) > 20:
+                            self.results.appendPlainText(f"  ... and {len(lines)-20} more")
+                except Exception:
+                    pass
+            progress_cb(len(entries), len(entries))
+            return {"matches": total_matches, "repos": repos_with_matches, "searched": len(entries)}
+
+        self.worker = GenericWorker(do_grep_history)
+        self.worker.log.connect(self.log)
+        self.worker.finished.connect(lambda s: (
+            self.hist_btn.setEnabled(True),
+            self.hist_btn.setText("Search History"),
+            self.status_label.setText(
+                f"{s['matches']} commits across {s['repos']} repos (searched {s['searched']})")
+        ))
+        self.worker.error.connect(lambda e: (
+            self.hist_btn.setEnabled(True), self.hist_btn.setText("Search History"), self.log(f"ERROR: {e}")
+        ))
+        self.worker.start()
+
+    def license_audit(self):
+        """Detect LICENSE files across all repos, flag missing/unknown."""
+        src = self.app.repos_dir
+        if not src:
+            return
+        self.results.clear()
+        self.results.appendPlainText("Scanning for LICENSE files across all repos...\n")
+
+        KNOWN_LICENSES = {
+            "mit": "MIT",
+            "apache": "Apache",
+            "gpl": "GPL",
+            "lgpl": "LGPL",
+            "bsd": "BSD",
+            "mpl": "MPL",
+            "isc": "ISC",
+            "unlicense": "Unlicense",
+            "cc0": "CC0",
+            "artistic": "Artistic",
+            "boost": "BSL",
+            "wtfpl": "WTFPL",
+            "zlib": "Zlib",
+            "agpl": "AGPL",
+        }
+
+        def do_audit(progress_cb, log_cb):
+            entries = sorted([d for d in os.listdir(src)
+                             if os.path.isdir(os.path.join(src, d, ".git"))])
+            results = {"found": [], "missing": [], "unknown": []}
+
+            for i, name in enumerate(entries):
+                progress_cb(i, len(entries))
+                rpath = os.path.join(src, name)
+                license_file = None
+                for candidate in ["LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE",
+                                  "LICENCE.md", "LICENCE.txt", "COPYING", "COPYING.md"]:
+                    fp = os.path.join(rpath, candidate)
+                    if os.path.isfile(fp):
+                        license_file = fp
+                        break
+
+                if not license_file:
+                    results["missing"].append(name)
+                    self.results.appendPlainText(f"  MISSING   {name}")
+                else:
+                    try:
+                        with open(license_file, 'r', errors='replace') as f:
+                            content = f.read(2000).lower()
+                        detected = None
+                        for key, label in KNOWN_LICENSES.items():
+                            if key in content:
+                                detected = label
+                                break
+                        if detected:
+                            results["found"].append((name, detected))
+                            self.results.appendPlainText(f"  {detected:10s}  {name}")
+                        else:
+                            results["unknown"].append(name)
+                            self.results.appendPlainText(f"  UNKNOWN   {name}")
+                    except Exception:
+                        results["unknown"].append(name)
+                        self.results.appendPlainText(f"  ERROR     {name}")
+
+            progress_cb(len(entries), len(entries))
+            return results
+
+        self.worker = GenericWorker(do_audit)
+        self.worker.log.connect(self.log)
+        self.worker.finished.connect(lambda r: self.status_label.setText(
+            f"{len(r['found'])} licensed, {len(r['missing'])} missing, {len(r['unknown'])} unknown"))
+        self.worker.error.connect(lambda e: self.log(f"ERROR: {e}"))
+        self.worker.start()
+
+    def find_abandoned(self):
+        """Flag repos with no commit activity in the last N months."""
+        src = self.app.repos_dir
+        git = self.app.git_exe
+        if not src or not git:
+            return
+        self.results.clear()
+        self.results.appendPlainText("Scanning for repos with no commits in the last 6 months...\n")
+
+        def do_find(progress_cb, log_cb):
+            entries = sorted([d for d in os.listdir(src)
+                             if os.path.isdir(os.path.join(src, d, ".git"))])
+            cutoff = time.time() - (180 * 86400)  # 6 months
+            abandoned = []
+
+            for i, name in enumerate(entries):
+                progress_cb(i, len(entries))
+                rpath = os.path.join(src, name)
+                try:
+                    r = subprocess.run(
+                        [git, "-C", rpath, "log", "-1", "--format=%ct %ci"],
+                        capture_output=True, text=True, timeout=10)
+                    if r.returncode == 0 and r.stdout.strip():
+                        parts = r.stdout.strip().split(" ", 1)
+                        ts = int(parts[0])
+                        date_str = parts[1] if len(parts) > 1 else "unknown"
+                        if ts < cutoff:
+                            days = int((time.time() - ts) / 86400)
+                            abandoned.append((name, days, date_str))
+                            self.results.appendPlainText(
+                                f"  {days:>4d} days  {name}  (last: {date_str[:10]})")
+                except Exception:
+                    pass
+
+            progress_cb(len(entries), len(entries))
+            return sorted(abandoned, key=lambda x: -x[1])
+
+        self.worker = GenericWorker(do_find)
+        self.worker.log.connect(self.log)
+        self.worker.finished.connect(lambda a: self.status_label.setText(
+            f"{len(a)} repos with no activity in 6+ months" if a else "All repos active!"))
+        self.worker.error.connect(lambda e: self.log(f"ERROR: {e}"))
+        self.worker.start()
+
+    def _export_results(self):
+        """Export the current results text to a file."""
+        text = self.results.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "Nothing to Export", "Run a search first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Results", "search_results.txt",
+            "Text Files (*.txt);;CSV Files (*.csv);;All Files (*)")
+        if path:
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.log(f"Results exported to {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed: {e}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB: INSIGHTS
@@ -1419,6 +1767,25 @@ class InsightsTab(QWidget):
         self.refresh_btn.clicked.connect(self.refresh)
         row.addWidget(self.refresh_btn)
         row.addStretch()
+
+        exp_lang_btn = QPushButton("Export Languages CSV")
+        exp_lang_btn.setProperty("class", "secondary")
+        exp_lang_btn.setFixedWidth(150)
+        exp_lang_btn.clicked.connect(lambda: export_table_to_csv(self.lang_table, self, "languages.csv"))
+        row.addWidget(exp_lang_btn)
+
+        exp_size_btn = QPushButton("Export Sizes CSV")
+        exp_size_btn.setProperty("class", "secondary")
+        exp_size_btn.setFixedWidth(130)
+        exp_size_btn.clicked.connect(lambda: export_table_to_csv(self.size_table, self, "largest_repos.csv"))
+        row.addWidget(exp_size_btn)
+
+        exp_act_btn = QPushButton("Export Activity CSV")
+        exp_act_btn.setProperty("class", "secondary")
+        exp_act_btn.setFixedWidth(140)
+        exp_act_btn.clicked.connect(lambda: export_table_to_csv(self.activity_table, self, "recent_activity.csv"))
+        row.addWidget(exp_act_btn)
+
         layout.addLayout(row)
 
         # Stats cards row
@@ -1600,10 +1967,20 @@ class APITab(QWidget):
         self.vis_combo.setFixedWidth(130)
         actions.addWidget(self.vis_combo)
 
+        self.dry_run_check = QCheckBox("Dry Run (preview only)")
+        self.dry_run_check.setToolTip("Preview API request bodies without executing them")
+        actions.addWidget(self.dry_run_check)
+
         apply_btn = QPushButton("Apply Changes")
         apply_btn.setProperty("class", "success")
         apply_btn.clicked.connect(self.apply_changes)
         actions.addWidget(apply_btn)
+
+        export_csv_btn = QPushButton("Export CSV")
+        export_csv_btn.setProperty("class", "secondary")
+        export_csv_btn.setFixedWidth(90)
+        export_csv_btn.clicked.connect(lambda: export_table_to_csv(self.table, self, "github_repos.csv"))
+        actions.addWidget(export_csv_btn)
         layout.addLayout(actions)
 
         # Dangerous actions
@@ -1697,88 +2074,179 @@ class APITab(QWidget):
             return False
         return True
 
-    def apply_changes(self):
-        if not self._require_token(): return
-        selected = self._get_selected_names()
-        if not selected: return
-
+    def _build_change_plan(self, selected):
+        """Build a list of planned API changes for preview or execution."""
         vis = self.vis_combo.currentText()
         repos = self.app.repos_cache or []
+        plan = []  # list of {"repo": full_name, "endpoint": ..., "method": ..., "body": ...}
 
+        for full_name in selected:
+            data = {}
+            if vis == "Public":
+                data["private"] = False
+            elif vis == "Private":
+                data["private"] = True
+
+            topic_update = None
+            for row in range(self.table.rowCount()):
+                if row < len(repos) and repos[row]["full_name"] == full_name:
+                    new_desc = self.table.item(row, 3).text() if self.table.item(row, 3) else ""
+                    if new_desc != repos[row]["description"]:
+                        data["description"] = new_desc
+
+                    new_topics = self.table.item(row, 5).text() if self.table.item(row, 5) else ""
+                    old_topics = ", ".join(repos[row].get("topics", []))
+                    if new_topics != old_topics:
+                        topic_update = [t.strip() for t in new_topics.split(",") if t.strip()]
+                    break
+
+            if data:
+                plan.append({
+                    "repo": full_name,
+                    "method": "PATCH",
+                    "endpoint": f"/repos/{full_name}",
+                    "body": data
+                })
+            if topic_update is not None:
+                plan.append({
+                    "repo": full_name,
+                    "method": "PUT",
+                    "endpoint": f"/repos/{full_name}/topics",
+                    "body": {"names": topic_update}
+                })
+        return plan
+
+    def apply_changes(self):
+        if not self._require_token():
+            return
+        selected = self._get_selected_names()
+        if not selected:
+            return
+
+        plan = self._build_change_plan(selected)
+
+        if not plan:
+            self.log("No changes detected for selected repos.")
+            return
+
+        # Dry-run mode: show preview only
+        if self.dry_run_check.isChecked():
+            preview = "DRY RUN - The following API calls would be made:\n\n"
+            for entry in plan:
+                preview += f"{entry['method']} {entry['endpoint']}\n"
+                preview += f"  Body: {json.dumps(entry['body'], indent=2)}\n\n"
+            self.log(preview)
+            QMessageBox.information(self, "Dry Run Preview",
+                f"{len(plan)} API calls planned.\n\nDetails written to Activity Log.")
+            return
+
+        # Backup metadata before changes
+        if self.app.repos_cache:
+            try:
+                snap_dir = os.path.join(get_config_dir(), "snapshots")
+                snap_path = snapshot_repo_metadata(self.app.repos_cache, snap_dir)
+                self.log(f"Metadata snapshot saved: {snap_path}")
+            except Exception as e:
+                self.log(f"Snapshot warning: {e}")
+
+        repos = self.app.repos_cache or []
         api = GitHubAPI(self.app.username, self.app.token)
 
         def do_apply(progress_cb, log_cb):
             stats = {"ok": 0, "err": 0}
-            total = len(selected)
-            for i, full_name in enumerate(selected):
+            total = len(plan)
+            for i, entry in enumerate(plan):
                 progress_cb(i, total)
-                data = {}
-                if vis == "Public": data["private"] = False
-                elif vis == "Private": data["private"] = True
+                log_cb(f"{entry['method']} {entry['endpoint']}: {entry['body']}")
+                try:
+                    if entry["method"] == "PATCH":
+                        resp = api.patch(entry["endpoint"], entry["body"], log_cb=log_cb)
+                    elif entry["method"] == "PUT":
+                        resp = requests.put(
+                            f"{api.BASE}{entry['endpoint']}",
+                            headers={**api.headers, "Accept": "application/vnd.github.mercy-preview+json"},
+                            json=entry["body"], timeout=15)
+                    else:
+                        continue
 
-                # Check for edited description
-                for row in range(self.table.rowCount()):
-                    if row < len(repos) and repos[row]["full_name"] == full_name:
-                        new_desc = self.table.item(row, 3).text() if self.table.item(row, 3) else ""
-                        if new_desc != repos[row]["description"]:
-                            data["description"] = new_desc
-
-                        new_topics = self.table.item(row, 5).text() if self.table.item(row, 5) else ""
-                        old_topics = ", ".join(repos[row].get("topics", []))
-                        if new_topics != old_topics:
-                            topic_list = [t.strip() for t in new_topics.split(",") if t.strip()]
-                            # Topics use a different endpoint
-                            requests.put(f"{api.BASE}/repos/{full_name}/topics",
-                                        headers={**api.headers, "Accept": "application/vnd.github.mercy-preview+json"},
-                                        json={"names": topic_list}, timeout=15)
-                        break
-
-                if data:
-                    log_cb(f"Updating {full_name}: {data}")
-                    resp = api.patch(f"/repos/{full_name}", data)
-                    if resp.status_code == 200:
+                    if resp.status_code in (200, 204):
                         stats["ok"] += 1
                     else:
                         stats["err"] += 1
                         log_cb(f"  -> Error: {resp.status_code}")
-                else:
-                    stats["ok"] += 1
+                except Exception as e:
+                    stats["err"] += 1
+                    log_cb(f"  -> {e}")
             progress_cb(total, total)
             return stats
 
         self.worker = GenericWorker(do_apply)
         self.worker.log.connect(self.log)
-        self.worker.finished.connect(lambda s: self.log(f"Apply complete: {s['ok']} ok, {s['err']} errors"))
+        self.worker.finished.connect(lambda s: self.log(
+            f"Apply complete: {s['ok']} ok, {s['err']} errors | Rate limit: {api.rate_limit_info}"))
         self.worker.error.connect(lambda e: self.log(f"ERROR: {e}"))
         self.worker.start()
 
     def archive_selected(self):
-        if not self._require_token(): return
+        if not self._require_token():
+            return
         selected = self._get_selected_names()
-        if not selected: return
+        if not selected:
+            return
+
+        # Dry-run check
+        if self.dry_run_check.isChecked():
+            self.log(f"DRY RUN: Would archive {len(selected)} repos: {', '.join(selected)}")
+            return
+
         if QMessageBox.question(self, "Confirm Archive",
                 f"Archive {len(selected)} repos?") != QMessageBox.StandardButton.Yes:
             return
+
+        # Backup before archive
+        if self.app.repos_cache:
+            try:
+                snap_dir = os.path.join(get_config_dir(), "snapshots")
+                snapshot_repo_metadata(self.app.repos_cache, snap_dir)
+            except Exception:
+                pass
+
         api = GitHubAPI(self.app.username, self.app.token)
         for name in selected:
             self.log(f"Archiving {name}...")
-            api.patch(f"/repos/{name}", {"archived": True})
-        self.log("Archive complete. Reload to see changes.")
+            api.patch(f"/repos/{name}", {"archived": True}, log_cb=self.log)
+        self.log(f"Archive complete. Rate limit: {api.rate_limit_info}")
 
     def unarchive_selected(self):
-        if not self._require_token(): return
+        if not self._require_token():
+            return
         selected = self._get_selected_names()
-        if not selected: return
+        if not selected:
+            return
+
+        # Dry-run check
+        if self.dry_run_check.isChecked():
+            self.log(f"DRY RUN: Would unarchive {len(selected)} repos: {', '.join(selected)}")
+            return
+
         api = GitHubAPI(self.app.username, self.app.token)
         for name in selected:
             self.log(f"Unarchiving {name}...")
-            api.patch(f"/repos/{name}", {"archived": False})
-        self.log("Unarchive complete. Reload to see changes.")
+            api.patch(f"/repos/{name}", {"archived": False}, log_cb=self.log)
+        self.log(f"Unarchive complete. Rate limit: {api.rate_limit_info}")
 
     def delete_selected(self):
-        if not self._require_token(): return
+        if not self._require_token():
+            return
         selected = self._get_selected_names()
-        if not selected: return
+        if not selected:
+            return
+
+        # Dry-run check
+        if self.dry_run_check.isChecked():
+            self.log(f"DRY RUN: Would DELETE {len(selected)} repos:\n  " + "\n  ".join(selected))
+            return
+
         confirm = QMessageBox.warning(self, "DANGER: Delete Repositories",
             f"This will PERMANENTLY DELETE {len(selected)} repositories from GitHub!\n\n"
             f"Repos:\n" + "\n".join(selected[:10]) +
@@ -1798,15 +2266,24 @@ class APITab(QWidget):
         if confirm2 != QMessageBox.StandardButton.Yes:
             return
 
+        # Backup before delete
+        if self.app.repos_cache:
+            try:
+                snap_dir = os.path.join(get_config_dir(), "snapshots")
+                snap_path = snapshot_repo_metadata(self.app.repos_cache, snap_dir)
+                self.log(f"Pre-delete snapshot saved: {snap_path}")
+            except Exception:
+                pass
+
         api = GitHubAPI(self.app.username, self.app.token)
         for name in selected:
             self.log(f"DELETING {name}...")
-            resp = api.delete(f"/repos/{name}")
+            resp = api.delete(f"/repos/{name}", log_cb=self.log)
             if resp.status_code == 204:
                 self.log(f"  -> Deleted")
             else:
                 self.log(f"  -> Error: {resp.status_code} {resp.text[:100]}")
-        self.log("Deletion complete. Refresh repo list.")
+        self.log(f"Deletion complete. Rate limit: {api.rate_limit_info}")
 
     def create_repo(self):
         if not self._require_token(): return
@@ -2446,7 +2923,7 @@ class MainWindow(QMainWindow):
         title.setProperty("class", "title")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #89b4fa;")
         header.addWidget(title)
-        ver = QLabel("v2.1")
+        ver = QLabel("v2.2")
         ver.setProperty("class", "subtitle")
         ver.setStyleSheet("color: #6c7086; font-size: 11px; padding-top: 8px;")
         header.addWidget(ver)
