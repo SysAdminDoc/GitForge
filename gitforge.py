@@ -34,10 +34,10 @@ def _bootstrap():
         import pip
     except ImportError:
         subprocess.check_call([sys.executable, '-m', 'ensurepip', '--default-pip'])
-    required = ['PyQt6', 'requests']
-    for pkg in required:
+    required = [('PyQt6', 'PyQt6'), ('requests', 'requests')]
+    for pkg, module_name in required:
         try:
-            __import__(pkg.split('[')[0].replace('-', '_').lower())
+            __import__(module_name)
         except ImportError:
             for flags in [[], ['--user'], ['--break-system-packages']]:
                 try:
@@ -214,7 +214,7 @@ class RepositoryProvider:
             self._rate_reset = None
 
     def _wait_if_rate_limited(self, log_cb=None):
-        if self._rate_remaining is None or self._rate_remaining > 5:
+        if self._rate_remaining is None or self._rate_remaining < 0 or self._rate_remaining > 5:
             return
         wait = max(0, (self._rate_reset or int(time.time())) - int(time.time())) + 1
         if 0 < wait < 900:
@@ -280,12 +280,18 @@ class GitHubAPI(RepositoryProvider):
 
     def _update_rate_info(self, resp):
         """Track rate limit from response headers."""
-        self._rate_remaining = int(resp.headers.get("X-RateLimit-Remaining", -1))
-        self._rate_reset = int(resp.headers.get("X-RateLimit-Reset", 0))
+        try:
+            self._rate_remaining = int(resp.headers.get("X-RateLimit-Remaining", -1))
+        except (TypeError, ValueError):
+            self._rate_remaining = None
+        try:
+            self._rate_reset = int(resp.headers.get("X-RateLimit-Reset", 0))
+        except (TypeError, ValueError):
+            self._rate_reset = None
 
     def _wait_if_rate_limited(self, log_cb=None):
         """If near rate limit, wait until reset."""
-        if self._rate_remaining is not None and self._rate_remaining <= 5:
+        if self._rate_remaining is not None and 0 <= self._rate_remaining <= 5:
             wait = max(0, self._rate_reset - int(time.time())) + 1
             if wait > 0 and wait < 900:  # cap at 15 min
                 if log_cb:
@@ -294,25 +300,31 @@ class GitHubAPI(RepositoryProvider):
 
     def get(self, path, params=None, log_cb=None):
         self._wait_if_rate_limited(log_cb)
-        resp = requests.get(f"{self.BASE}{path}", headers=self.headers, params=params, timeout=30)
+        resp = self.session.get(f"{self.BASE}{path}", headers=self.headers, params=params, timeout=30)
         self._update_rate_info(resp)
         return resp
 
     def patch(self, path, data, log_cb=None):
         self._wait_if_rate_limited(log_cb)
-        resp = requests.patch(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
+        resp = self.session.patch(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
         self._update_rate_info(resp)
         return resp
 
     def post(self, path, data, log_cb=None):
         self._wait_if_rate_limited(log_cb)
-        resp = requests.post(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
+        resp = self.session.post(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
+        self._update_rate_info(resp)
+        return resp
+
+    def put(self, path, data=None, log_cb=None):
+        self._wait_if_rate_limited(log_cb)
+        resp = self.session.put(f"{self.BASE}{path}", headers=self.headers, json=data, timeout=30)
         self._update_rate_info(resp)
         return resp
 
     def delete(self, path, log_cb=None):
         self._wait_if_rate_limited(log_cb)
-        resp = requests.delete(f"{self.BASE}{path}", headers=self.headers, timeout=30)
+        resp = self.session.delete(f"{self.BASE}{path}", headers=self.headers, timeout=30)
         self._update_rate_info(resp)
         return resp
 
@@ -372,6 +384,134 @@ class GitHubAPI(RepositoryProvider):
             if len(data) < 100: break
             page += 1
         return repos
+
+    def _require_success(self, response, expected=(200, 201, 204)):
+        if response.status_code not in expected:
+            raise Exception(f"GitHub API error {response.status_code}: {response.text[:300]}")
+        return response.json() if response.status_code != 204 and response.text else None
+
+    def _get_pages(self, path, params=None, log_cb=None):
+        values = []
+        page = 1
+        while True:
+            page_params = {**(params or {}), "per_page": 100, "page": page}
+            response = self.get(path, page_params, log_cb=log_cb)
+            payload = self._require_success(response)
+            if isinstance(payload, dict):
+                values.extend(payload.get("items", payload.get("workflows", payload.get("values", []))))
+            elif isinstance(payload, list):
+                values.extend(payload)
+            if not isinstance(payload, list) or len(payload) < 100:
+                break
+            page += 1
+        return values
+
+    def list_releases(self, full_name, log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/releases", log_cb=log_cb)
+
+    def create_release(self, full_name, tag_name, name="", body="", target_commitish="", draft=False, prerelease=False):
+        payload = {
+            "tag_name": tag_name, "name": name or tag_name, "body": body,
+            "draft": bool(draft), "prerelease": bool(prerelease),
+        }
+        if target_commitish:
+            payload["target_commitish"] = target_commitish
+        return self._require_success(self.post(f"/repos/{full_name}/releases", payload))
+
+    def update_release(self, full_name, release_id, **changes):
+        return self._require_success(self.patch(f"/repos/{full_name}/releases/{release_id}", changes))
+
+    def delete_release(self, full_name, release_id):
+        return self._require_success(self.delete(f"/repos/{full_name}/releases/{release_id}"))
+
+    def get_branch_protection(self, full_name, branch):
+        response = self.get(f"/repos/{full_name}/branches/{requests.utils.quote(branch, safe='')}/protection")
+        return self._require_success(response)
+
+    def set_branch_protection(self, full_name, branch, protection):
+        response = self.put(
+            f"/repos/{full_name}/branches/{requests.utils.quote(branch, safe='')}/protection",
+            protection,
+        )
+        return self._require_success(response)
+
+    def list_workflows(self, full_name, log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/actions/workflows", log_cb=log_cb)
+
+    def list_workflow_runs(self, full_name, workflow_id=None, log_cb=None):
+        path = f"/repos/{full_name}/actions/runs"
+        if workflow_id:
+            path = f"/repos/{full_name}/actions/workflows/{workflow_id}/runs"
+        return self._get_pages(path, log_cb=log_cb)
+
+    def set_workflow_enabled(self, full_name, workflow_id, enabled=True):
+        action = "enable" if enabled else "disable"
+        return self._require_success(self.put(f"/repos/{full_name}/actions/workflows/{workflow_id}/{action}"))
+
+    def list_secrets(self, full_name, log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/actions/secrets", log_cb=log_cb)
+
+    def list_variables(self, full_name, log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/actions/variables", log_cb=log_cb)
+
+    def get_secret_public_key(self, full_name):
+        response = self.get(f"/repos/{full_name}/actions/secrets/public-key")
+        return self._require_success(response)
+
+    @staticmethod
+    def encrypt_secret(public_key, value):
+        """Encrypt a secret using GitHub's sealed-box format when PyNaCl exists."""
+        try:
+            from nacl.public import PublicKey, SealedBox
+            from nacl.encoding import Base64Encoder
+        except ImportError as error:
+            raise RuntimeError("PyNaCl is required to write GitHub Actions secrets") from error
+        key = PublicKey(public_key.encode("ascii"), encoder=Base64Encoder)
+        encrypted = SealedBox(key).encrypt(value.encode("utf-8"))
+        return Base64Encoder.encode(encrypted).decode("ascii")
+
+    def upsert_secret(self, full_name, secret_name, value):
+        key = self.get_secret_public_key(full_name)
+        encrypted = self.encrypt_secret(key["key"], value)
+        payload = {"encrypted_value": encrypted, "key_id": key["key_id"]}
+        return self._require_success(self.put(f"/repos/{full_name}/actions/secrets/{secret_name}", payload))
+
+    def delete_secret(self, full_name, secret_name):
+        return self._require_success(self.delete(f"/repos/{full_name}/actions/secrets/{secret_name}"))
+
+    def upsert_variable(self, full_name, variable_name, value, visibility="selected"):
+        payload = {"name": variable_name, "value": value, "visibility": visibility}
+        response = self.put(f"/repos/{full_name}/actions/variables/{variable_name}", payload)
+        if response.status_code == 404:
+            response = self.post(f"/repos/{full_name}/actions/variables", payload)
+        return self._require_success(response)
+
+    def delete_variable(self, full_name, variable_name):
+        return self._require_success(self.delete(f"/repos/{full_name}/actions/variables/{variable_name}"))
+
+    def list_webhooks(self, full_name, log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/hooks", log_cb=log_cb)
+
+    def list_collaborators(self, full_name, affiliation="all", log_cb=None):
+        return self._get_pages(
+            f"/repos/{full_name}/collaborators", {"affiliation": affiliation}, log_cb=log_cb
+        )
+
+    def audit_collaborators(self, repositories, log_cb=None):
+        """Return a cross-repository collaborator report without exposing tokens."""
+        report = []
+        for repo in repositories:
+            full_name = repo.get("full_name") or repo.get("name")
+            if not full_name:
+                continue
+            for collaborator in self.list_collaborators(full_name, log_cb=log_cb):
+                report.append({
+                    "repository": full_name,
+                    "login": collaborator.get("login", ""),
+                    "role": collaborator.get("role_name") or collaborator.get("permissions", {}),
+                    "type": collaborator.get("type", "User"),
+                })
+        return report
 
 
 class GitLabAPI(RepositoryProvider):
@@ -599,7 +739,7 @@ class BitbucketAPI(RepositoryProvider):
         path = f"/repositories/{workspace}"
         while path:
             if log_cb:
-                log_cb(f"Fetching Bitbucket repositories...")
+                log_cb("Fetching Bitbucket repositories...")
             response = self.get(path, params={"pagelen": 100} if not path.startswith("http") else None, log_cb=log_cb)
             if response.status_code in (401, 403):
                 raise Exception("Bitbucket authentication failed or workspace access was denied.")
@@ -2675,6 +2815,9 @@ class APITab(QWidget):
         return names
 
     def _require_token(self):
+        if self.app.provider_id != "github":
+            QMessageBox.warning(self, "GitHub Provider Required", "Switch the Repository Provider to GitHub for this management tab.")
+            return False
         if not self.app.token:
             QMessageBox.warning(self, "Token Required", "Add a Personal Access Token in Settings.")
             return False
@@ -2756,7 +2899,7 @@ class APITab(QWidget):
                 self.log(f"Snapshot warning: {e}")
 
         repos = self.app.repos_cache or []
-        api = GitHubAPI(self.app.username, self.app.token)
+        api = self.app.get_provider()
 
         def do_apply(progress_cb, log_cb):
             stats = {"ok": 0, "err": 0}
@@ -2768,10 +2911,7 @@ class APITab(QWidget):
                     if entry["method"] == "PATCH":
                         resp = api.patch(entry["endpoint"], entry["body"], log_cb=log_cb)
                     elif entry["method"] == "PUT":
-                        resp = requests.put(
-                            f"{api.BASE}{entry['endpoint']}",
-                            headers={**api.headers, "Accept": "application/vnd.github.mercy-preview+json"},
-                            json=entry["body"], timeout=15)
+                        resp = api.put(entry["endpoint"], entry["body"])
                     else:
                         continue
 
@@ -2817,7 +2957,7 @@ class APITab(QWidget):
             except Exception:
                 pass
 
-        api = GitHubAPI(self.app.username, self.app.token)
+        api = self.app.get_provider()
         for name in selected:
             self.log(f"Archiving {name}...")
             api.patch(f"/repos/{name}", {"archived": True}, log_cb=self.log)
@@ -2835,7 +2975,7 @@ class APITab(QWidget):
             self.log(f"DRY RUN: Would unarchive {len(selected)} repos: {', '.join(selected)}")
             return
 
-        api = GitHubAPI(self.app.username, self.app.token)
+        api = self.app.get_provider()
         for name in selected:
             self.log(f"Unarchiving {name}...")
             api.patch(f"/repos/{name}", {"archived": False}, log_cb=self.log)
@@ -2881,7 +3021,7 @@ class APITab(QWidget):
             except Exception:
                 pass
 
-        api = GitHubAPI(self.app.username, self.app.token)
+        api = self.app.get_provider()
         for name in selected:
             self.log(f"DELETING {name}...")
             resp = api.delete(f"/repos/{name}", log_cb=self.log)
@@ -2897,7 +3037,7 @@ class APITab(QWidget):
         if not name:
             QMessageBox.warning(self, "Name Required", "Enter a repo name.")
             return
-        api = GitHubAPI(self.app.username, self.app.token)
+        api = self.app.get_provider()
         data = {
             "name": name,
             "description": self.new_desc.text().strip(),
@@ -3485,6 +3625,439 @@ class DiffTab(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB: ADVANCED GITHUB API COVERAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+class AdvancedAPITab(QWidget):
+    """Release, protection, Actions, secrets, webhook, and collaborator tools."""
+
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, app_state):
+        super().__init__()
+        self.app = app_state
+        self.worker = None
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("GitHub repository:"))
+        self.repo_combo = QComboBox()
+        top.addWidget(self.repo_combo, 1)
+        refresh = QPushButton("Refresh Repos")
+        refresh.setProperty("class", "secondary")
+        refresh.clicked.connect(self.refresh_repos)
+        top.addWidget(refresh)
+        self.dry_run = QCheckBox("Dry run")
+        self.dry_run.setToolTip("Preview mutating requests without sending them")
+        top.addWidget(self.dry_run)
+        layout.addLayout(top)
+        self.refresh_repos()
+
+        releases = QGroupBox("  Releases Manager")
+        releases_layout = QVBoxLayout(releases)
+        release_controls = QHBoxLayout()
+        self.release_tag = QLineEdit()
+        self.release_tag.setPlaceholderText("tag, e.g. v3.0.0")
+        release_controls.addWidget(self.release_tag, 1)
+        self.release_name = QLineEdit()
+        self.release_name.setPlaceholderText("Release title")
+        release_controls.addWidget(self.release_name, 1)
+        self.release_draft = QCheckBox("Draft")
+        release_controls.addWidget(self.release_draft)
+        self.release_prerelease = QCheckBox("Pre-release")
+        release_controls.addWidget(self.release_prerelease)
+        release_list = QPushButton("List")
+        release_list.setProperty("class", "secondary")
+        release_list.clicked.connect(self.list_releases)
+        release_controls.addWidget(release_list)
+        release_create = QPushButton("Create")
+        release_create.setProperty("class", "success")
+        release_create.clicked.connect(self.create_release)
+        release_controls.addWidget(release_create)
+        release_delete = QPushButton("Delete Selected")
+        release_delete.setProperty("class", "danger")
+        release_delete.clicked.connect(self.delete_release)
+        release_controls.addWidget(release_delete)
+        releases_layout.addLayout(release_controls)
+        self.release_body = QPlainTextEdit()
+        self.release_body.setPlaceholderText("Release notes")
+        self.release_body.setMaximumHeight(70)
+        releases_layout.addWidget(self.release_body)
+        self.release_table = make_table([
+            ("Tag", 160, "fixed"), ("Title", 0, "stretch"), ("State", 100, "fixed"), ("ID", 90, "fixed")
+        ])
+        self.release_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.release_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        releases_layout.addWidget(self.release_table)
+        layout.addWidget(releases)
+
+        protection = QGroupBox("  Branch Protection")
+        protection_layout = QHBoxLayout(protection)
+        protection_layout.addWidget(QLabel("Branch:"))
+        self.protection_branch = QLineEdit()
+        self.protection_branch.setPlaceholderText("main")
+        protection_layout.addWidget(self.protection_branch, 1)
+        protection_layout.addWidget(QLabel("Required reviews:"))
+        self.required_reviews = QSpinBox()
+        self.required_reviews.setRange(0, 6)
+        protection_layout.addWidget(self.required_reviews)
+        self.enforce_admins = QCheckBox("Enforce admins")
+        protection_layout.addWidget(self.enforce_admins)
+        load_protection = QPushButton("Load")
+        load_protection.setProperty("class", "secondary")
+        load_protection.clicked.connect(self.load_protection)
+        protection_layout.addWidget(load_protection)
+        apply_protection = QPushButton("Apply")
+        apply_protection.setProperty("class", "warning")
+        apply_protection.clicked.connect(self.apply_protection)
+        protection_layout.addWidget(apply_protection)
+        layout.addWidget(protection)
+
+        workflows = QGroupBox("  Actions / Workflow Browser")
+        workflows_layout = QVBoxLayout(workflows)
+        workflow_controls = QHBoxLayout()
+        list_workflows_btn = QPushButton("List Workflows")
+        list_workflows_btn.setProperty("class", "secondary")
+        list_workflows_btn.clicked.connect(self.list_workflows)
+        workflow_controls.addWidget(list_workflows_btn)
+        enable_workflow = QPushButton("Enable Selected")
+        enable_workflow.setProperty("class", "success")
+        enable_workflow.clicked.connect(lambda: self.set_workflow(True))
+        workflow_controls.addWidget(enable_workflow)
+        disable_workflow = QPushButton("Disable Selected")
+        disable_workflow.setProperty("class", "warning")
+        disable_workflow.clicked.connect(lambda: self.set_workflow(False))
+        workflow_controls.addWidget(disable_workflow)
+        workflow_runs = QPushButton("Load Runs")
+        workflow_runs.setProperty("class", "secondary")
+        workflow_runs.clicked.connect(self.list_workflow_runs)
+        workflow_controls.addWidget(workflow_runs)
+        workflow_controls.addStretch()
+        workflows_layout.addLayout(workflow_controls)
+        self.workflow_table = make_table([
+            ("Name", 0, "stretch"), ("State", 100, "fixed"), ("ID", 90, "fixed"), ("Path", 180, "fixed")
+        ])
+        self.workflow_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.workflow_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        workflows_layout.addWidget(self.workflow_table)
+        layout.addWidget(workflows)
+
+        actions = QGroupBox("  Secrets, Variables, Webhooks, and Collaborators")
+        actions_layout = QVBoxLayout(actions)
+        actions_controls = QHBoxLayout()
+        actions_controls.addWidget(QLabel("Name:"))
+        self.action_name = QLineEdit()
+        self.action_name.setPlaceholderText("SECRET_OR_VARIABLE")
+        actions_controls.addWidget(self.action_name, 1)
+        actions_controls.addWidget(QLabel("Value:"))
+        self.action_value = QLineEdit()
+        self.action_value.setPlaceholderText("Never displayed in results")
+        self.action_value.setEchoMode(QLineEdit.EchoMode.Password)
+        actions_controls.addWidget(self.action_value, 1)
+        self.action_kind = QComboBox()
+        self.action_kind.addItems(["Secret", "Variable"])
+        actions_controls.addWidget(self.action_kind)
+        upsert = QPushButton("Upsert")
+        upsert.setProperty("class", "success")
+        upsert.clicked.connect(self.upsert_action_value)
+        actions_controls.addWidget(upsert)
+        list_actions = QPushButton("List")
+        list_actions.setProperty("class", "secondary")
+        list_actions.clicked.connect(self.list_action_values)
+        actions_controls.addWidget(list_actions)
+        delete_action = QPushButton("Delete")
+        delete_action.setProperty("class", "danger")
+        delete_action.clicked.connect(self.delete_action_value)
+        actions_controls.addWidget(delete_action)
+        actions_layout.addLayout(actions_controls)
+        audit_controls = QHBoxLayout()
+        list_hooks = QPushButton("List Webhooks")
+        list_hooks.setProperty("class", "secondary")
+        list_hooks.clicked.connect(self.list_webhooks)
+        audit_controls.addWidget(list_hooks)
+        audit_collaborators = QPushButton("Audit Collaborators Across Repos")
+        audit_collaborators.setProperty("class", "secondary")
+        audit_collaborators.clicked.connect(self.audit_collaborators)
+        audit_controls.addWidget(audit_collaborators)
+        audit_controls.addStretch()
+        actions_layout.addLayout(audit_controls)
+        self.api_output = QPlainTextEdit()
+        self.api_output.setReadOnly(True)
+        self.api_output.setMaximumHeight(130)
+        actions_layout.addWidget(self.api_output)
+        layout.addWidget(actions)
+        layout.addStretch()
+
+    def log(self, message):
+        self.log_signal.emit(message)
+
+    def refresh_repos(self):
+        current = self.repo_combo.currentData()
+        self.repo_combo.clear()
+        for repo in self.app.repos_cache or []:
+            self.repo_combo.addItem(repo.get("full_name") or repo.get("name", ""), repo.get("full_name") or repo.get("name", ""))
+        if current:
+            index = self.repo_combo.findData(current)
+            if index >= 0:
+                self.repo_combo.setCurrentIndex(index)
+
+    def _api(self):
+        provider = self.app.get_provider()
+        if not isinstance(provider, GitHubAPI):
+            self.log("Advanced API coverage currently requires the GitHub provider.")
+            return None
+        if not self.app.token:
+            self.log("A GitHub token is required for advanced API operations.")
+            return None
+        return provider
+
+    def _repo(self):
+        return self.repo_combo.currentData()
+
+    def _preview_or_confirm(self, method, endpoint, payload=None):
+        if self.dry_run.isChecked():
+            self.log(f"DRY RUN: {method} {endpoint} {json.dumps(payload or {}, sort_keys=True)}")
+            return False
+        return True
+
+    def list_releases(self):
+        api = self._api()
+        repo = self._repo()
+        if not api or not repo:
+            return
+        try:
+            releases = api.list_releases(repo)
+            self.release_table.setRowCount(len(releases))
+            for row, release in enumerate(releases):
+                self.release_table.setItem(row, 0, QTableWidgetItem(release.get("tag_name", "")))
+                self.release_table.setItem(row, 1, QTableWidgetItem(release.get("name") or ""))
+                state = "draft" if release.get("draft") else ("pre-release" if release.get("prerelease") else "published")
+                self.release_table.setItem(row, 2, QTableWidgetItem(state))
+                item = QTableWidgetItem(str(release.get("id", "")))
+                item.setData(Qt.ItemDataRole.UserRole, release.get("id"))
+                self.release_table.setItem(row, 3, item)
+            self.log(f"Loaded {len(releases)} releases for {repo}")
+        except Exception as error:
+            self.log(f"Release error: {error}")
+
+    def create_release(self):
+        api = self._api()
+        repo = self._repo()
+        tag = self.release_tag.text().strip()
+        if not api or not repo or not tag:
+            return
+        payload = {"tag_name": tag, "name": self.release_name.text().strip() or tag, "body": self.release_body.toPlainText(), "draft": self.release_draft.isChecked(), "prerelease": self.release_prerelease.isChecked()}
+        if not self._preview_or_confirm("POST", f"/repos/{repo}/releases", payload):
+            return
+        try:
+            api.create_release(repo, **payload)
+            self.log(f"Created release {tag} for {repo}")
+            self.list_releases()
+        except Exception as error:
+            self.log(f"Release error: {error}")
+
+    def delete_release(self):
+        api = self._api()
+        repo = self._repo()
+        row = self.release_table.currentRow()
+        item = self.release_table.item(row, 3) if row >= 0 else None
+        if not api or not repo or not item:
+            return
+        release_id = item.data(Qt.ItemDataRole.UserRole)
+        if not self._preview_or_confirm("DELETE", f"/repos/{repo}/releases/{release_id}"):
+            return
+        try:
+            api.delete_release(repo, release_id)
+            self.log(f"Deleted release {release_id} from {repo}")
+            self.list_releases()
+        except Exception as error:
+            self.log(f"Release error: {error}")
+
+    def load_protection(self):
+        api = self._api()
+        repo = self._repo()
+        branch = self.protection_branch.text().strip()
+        if not api or not repo or not branch:
+            return
+        try:
+            payload = api.get_branch_protection(repo, branch)
+            reviews = payload.get("required_pull_request_reviews") or {}
+            self.required_reviews.setValue(reviews.get("required_approving_review_count") or 0)
+            admins = payload.get("enforce_admins") or {}
+            self.enforce_admins.setChecked(bool(admins.get("enabled")))
+            self.api_output.setPlainText(json.dumps(payload, indent=2))
+        except Exception as error:
+            self.log(f"Protection error: {error}")
+
+    def apply_protection(self):
+        api = self._api()
+        repo = self._repo()
+        branch = self.protection_branch.text().strip()
+        if not api or not repo or not branch:
+            return
+        payload = {
+            "required_status_checks": None,
+            "enforce_admins": self.enforce_admins.isChecked(),
+            "required_pull_request_reviews": {"required_approving_review_count": self.required_reviews.value()} if self.required_reviews.value() else None,
+            "restrictions": None,
+            "required_linear_history": False,
+            "allow_force_pushes": False,
+            "allow_deletions": False,
+            "block_creations": False,
+            "required_conversation_resolution": False,
+        }
+        if not self._preview_or_confirm("PUT", f"/repos/{repo}/branches/{branch}/protection", payload):
+            return
+        try:
+            api.set_branch_protection(repo, branch, payload)
+            self.log(f"Updated branch protection for {repo}:{branch}")
+        except Exception as error:
+            self.log(f"Protection error: {error}")
+
+    def list_workflows(self):
+        api = self._api()
+        repo = self._repo()
+        if not api or not repo:
+            return
+        try:
+            workflows = api.list_workflows(repo)
+            self.workflow_table.setRowCount(len(workflows))
+            for row, workflow in enumerate(workflows):
+                name = QTableWidgetItem(workflow.get("name", ""))
+                name.setData(Qt.ItemDataRole.UserRole, workflow.get("id"))
+                self.workflow_table.setItem(row, 0, name)
+                self.workflow_table.setItem(row, 1, QTableWidgetItem(workflow.get("state", "")))
+                self.workflow_table.setItem(row, 2, QTableWidgetItem(str(workflow.get("id", ""))))
+                self.workflow_table.setItem(row, 3, QTableWidgetItem(workflow.get("path", "")))
+            self.log(f"Loaded {len(workflows)} workflows for {repo}")
+        except Exception as error:
+            self.log(f"Workflow error: {error}")
+
+    def _selected_workflow_id(self):
+        row = self.workflow_table.currentRow()
+        item = self.workflow_table.item(row, 0) if row >= 0 else None
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def set_workflow(self, enabled):
+        api = self._api()
+        repo = self._repo()
+        workflow_id = self._selected_workflow_id()
+        if not api or not repo or not workflow_id:
+            return
+        action = "enable" if enabled else "disable"
+        if not self._preview_or_confirm("PUT", f"/repos/{repo}/actions/workflows/{workflow_id}/{action}"):
+            return
+        try:
+            api.set_workflow_enabled(repo, workflow_id, enabled)
+            self.log(f"Workflow {action}d: {workflow_id} in {repo}")
+            self.list_workflows()
+        except Exception as error:
+            self.log(f"Workflow error: {error}")
+
+    def list_workflow_runs(self):
+        api = self._api()
+        repo = self._repo()
+        if not api or not repo:
+            return
+        try:
+            runs = api.list_workflow_runs(repo, self._selected_workflow_id())
+            self.api_output.setPlainText(json.dumps(runs[:100], indent=2))
+            self.log(f"Loaded {len(runs)} workflow runs for {repo}")
+        except Exception as error:
+            self.log(f"Workflow error: {error}")
+
+    def list_action_values(self):
+        api = self._api()
+        repo = self._repo()
+        if not api or not repo:
+            return
+        try:
+            if self.action_kind.currentText() == "Secret":
+                values = api.list_secrets(repo)
+                label = "secrets"
+            else:
+                values = api.list_variables(repo)
+                label = "variables"
+            self.api_output.setPlainText(json.dumps(values, indent=2))
+            self.log(f"Loaded {len(values)} {label} for {repo}; secret values are never returned by GitHub")
+        except Exception as error:
+            self.log(f"Actions variable error: {error}")
+
+    def upsert_action_value(self):
+        api = self._api()
+        repo = self._repo()
+        name = self.action_name.text().strip()
+        value = self.action_value.text()
+        if not api or not repo or not name or not value:
+            return
+        kind = self.action_kind.currentText()
+        endpoint = f"/repos/{repo}/actions/{'secrets' if kind == 'Secret' else 'variables'}/{name}"
+        if not self._preview_or_confirm("PUT", endpoint, {"name": name, "value": "[redacted]"}):
+            return
+        try:
+            if kind == "Secret":
+                api.upsert_secret(repo, name, value)
+            else:
+                api.upsert_variable(repo, name, value)
+            self.action_value.clear()
+            self.log(f"Upserted {kind.lower()} {name} in {repo}")
+        except Exception as error:
+            self.log(f"Actions variable error: {error}")
+
+    def delete_action_value(self):
+        api = self._api()
+        repo = self._repo()
+        name = self.action_name.text().strip()
+        if not api or not repo or not name:
+            return
+        kind = self.action_kind.currentText()
+        endpoint = f"/repos/{repo}/actions/{'secrets' if kind == 'Secret' else 'variables'}/{name}"
+        if not self._preview_or_confirm("DELETE", endpoint):
+            return
+        try:
+            if kind == "Secret":
+                api.delete_secret(repo, name)
+            else:
+                api.delete_variable(repo, name)
+            self.log(f"Deleted {kind.lower()} {name} from {repo}")
+        except Exception as error:
+            self.log(f"Actions variable error: {error}")
+
+    def list_webhooks(self):
+        api = self._api()
+        repo = self._repo()
+        if not api or not repo:
+            return
+        try:
+            hooks = api.list_webhooks(repo)
+            safe_hooks = []
+            for hook in hooks:
+                safe_hooks.append({
+                    "id": hook.get("id"), "type": hook.get("type"), "active": hook.get("active"),
+                    "events": hook.get("events", []), "config": {"url": "[redacted]"},
+                })
+            self.api_output.setPlainText(json.dumps(safe_hooks, indent=2))
+            self.log(f"Loaded {len(hooks)} webhooks for {repo}")
+        except Exception as error:
+            self.log(f"Webhook error: {error}")
+
+    def audit_collaborators(self):
+        api = self._api()
+        repos = self.app.repos_cache or []
+        if not api or not repos:
+            return
+        try:
+            report = api.audit_collaborators(repos, log_cb=self.log)
+            self.api_output.setPlainText(json.dumps(report, indent=2))
+            self.log(f"Audited {len(report)} collaborator assignments")
+        except Exception as error:
+            self.log(f"Collaborator error: {error}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TAB: LOCAL OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 class LocalOpsTab(QWidget):
@@ -3891,6 +4464,10 @@ class MainWindow(QMainWindow):
         self.api_tab = APITab(self.state)
         self.api_tab.log_signal.connect(self.log)
         self.tabs.addTab(self.api_tab, "GitHub API")
+
+        self.advanced_api_tab = AdvancedAPITab(self.state)
+        self.advanced_api_tab.log_signal.connect(self.log)
+        self.tabs.addTab(self.advanced_api_tab, "Advanced API")
 
         splitter.addWidget(self.tabs)
 

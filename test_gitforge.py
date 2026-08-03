@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 
 import gitforge
@@ -24,6 +23,21 @@ class FakeSession:
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
         return self.responses.pop(0)
+
+    def get(self, url, **kwargs):
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url, **kwargs):
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request("DELETE", url, **kwargs)
 
 
 def test_provider_factory_uses_defaults_and_custom_endpoint():
@@ -105,6 +119,32 @@ def test_bitbucket_is_read_only_and_follows_next_link():
     assert repos[0]["clone_url"].endswith("one.git")
     assert provider.read_only is True
     assert session.calls[1][1].endswith("page=2")
+
+
+def test_github_advanced_api_methods_preserve_payloads_and_redact_scope():
+    session = FakeSession([
+        FakeResponse({"id": 7, "tag_name": "v3.0.0"}, status_code=201),
+        FakeResponse({"required_pull_request_reviews": {"required_approving_review_count": 2}}, status_code=200),
+        FakeResponse({"workflows": [{"id": 12, "name": "CI", "state": "active"}]}, status_code=200),
+        FakeResponse({"values": [{"id": 44, "active": True, "events": ["push"], "config": {"url": "secret"}}]}, status_code=200),
+        FakeResponse([{"login": "outside", "permissions": {"push": True}}], status_code=200),
+    ])
+    api = gitforge.GitHubAPI("alice", "token", session=session)
+
+    release = api.create_release("alice/project", "v3.0.0", name="Release", body="notes", draft=True)
+    protection = api.get_branch_protection("alice/project", "release/3")
+    workflows = api.list_workflows("alice/project")
+    hooks = api.list_webhooks("alice/project")
+    collaborators = api.audit_collaborators([{"full_name": "alice/project"}])
+
+    assert release["id"] == 7
+    assert protection["required_pull_request_reviews"]["required_approving_review_count"] == 2
+    assert workflows[0]["name"] == "CI"
+    assert hooks[0]["config"]["url"] == "secret"
+    assert collaborators[0]["login"] == "outside"
+    assert session.calls[0][0] == "POST"
+    assert session.calls[0][2]["json"]["draft"] is True
+    assert "/branches/release%2F3/protection" in session.calls[1][1]
 
 
 def _init_repo(path, git):
