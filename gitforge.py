@@ -4,7 +4,7 @@ GitForge - Complete GitHub Repository Manager
 Clone, sync, backup, search, and manage all your GitHub repos from one tool.
 """
 
-import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch, csv, io
+import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch, csv, io, tempfile
 from pathlib import Path
 
 
@@ -632,6 +632,242 @@ def create_provider(config):
         username=kwargs["identity"], token=kwargs["token"],
         base_url=kwargs["base_url"],
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOCAL GIT OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+class GitCommandError(RuntimeError):
+    """Raised when a local Git operation fails with useful command output."""
+
+    def __init__(self, command, returncode, stderr="", stdout=""):
+        self.command = command
+        self.returncode = returncode
+        self.stderr = stderr.strip()
+        self.stdout = stdout.strip()
+        detail = self.stderr or self.stdout or f"exit code {returncode}"
+        super().__init__(f"{' '.join(command)}: {detail}")
+
+
+def run_git(git_exe, repo_path, args, timeout=60, env=None, input_text=None):
+    """Run Git without a shell and return stdout, raising a typed error."""
+    command = [git_exe, "-C", os.fspath(repo_path), *[str(arg) for arg in args]]
+    result = subprocess.run(
+        command, input=input_text, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=timeout, env=env,
+    )
+    if result.returncode != 0:
+        raise GitCommandError(command, result.returncode, result.stderr, result.stdout)
+    return result.stdout.strip()
+
+
+def discover_local_repos(root):
+    """Find working repositories below *root*, without descending into .git."""
+    if not root or not os.path.isdir(root):
+        return []
+    found = []
+    for current, dirs, _ in os.walk(root):
+        git_marker = os.path.join(current, ".git")
+        if ".git" in dirs or os.path.isfile(git_marker):
+            found.append(os.path.abspath(current))
+            if ".git" in dirs:
+                dirs.remove(".git")
+    return sorted(found, key=lambda path: path.lower())
+
+
+def list_worktrees(git_exe, repo_path):
+    """Return structured entries from ``git worktree list --porcelain``."""
+    output = run_git(git_exe, repo_path, ["worktree", "list", "--porcelain"])
+    worktrees = []
+    current = None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            if current:
+                worktrees.append(current)
+            current = {"path": os.path.normpath(line[9:]), "head": "", "branch": "", "bare": False, "locked": False}
+        elif current is not None and line.startswith("HEAD "):
+            current["head"] = line[5:]
+        elif current is not None and line.startswith("branch "):
+            current["branch"] = line[7:].removeprefix("refs/heads/")
+        elif current is not None and line == "bare":
+            current["bare"] = True
+        elif current is not None and line == "locked":
+            current["locked"] = True
+    if current:
+        worktrees.append(current)
+    return worktrees
+
+
+def create_worktree(git_exe, repo_path, worktree_path, branch, new_branch=False):
+    """Create a worktree, optionally creating its branch from the current HEAD."""
+    args = ["worktree", "add"]
+    if new_branch:
+        args.extend(["-b", branch])
+        args.append(os.fspath(worktree_path))
+    else:
+        args.extend([os.fspath(worktree_path), branch])
+    return run_git(git_exe, repo_path, args, timeout=120)
+
+
+def remove_worktree(git_exe, repo_path, worktree_path, force=False):
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(os.fspath(worktree_path))
+    return run_git(git_exe, repo_path, args, timeout=120)
+
+
+def list_submodules(git_exe, repo_path):
+    """Return recursive submodule status, including uninitialized entries."""
+    result = subprocess.run(
+        [git_exe, "-C", os.fspath(repo_path), "submodule", "status", "--recursive"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+    )
+    if result.returncode not in (0, 1):
+        raise GitCommandError(result.args, result.returncode, result.stderr, result.stdout)
+    modules = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        marker = line[0]
+        fields = line[1:].strip().split(None, 2)
+        if len(fields) < 2:
+            continue
+        modules.append({
+            "status": {"-": "uninitialized", "+": "out-of-date", "U": "conflict"}.get(marker, "current"),
+            "commit": fields[0], "path": fields[1],
+            "description": fields[2].strip(" ()") if len(fields) > 2 else "",
+        })
+    return modules
+
+
+def update_submodules(git_exe, repo_path):
+    return run_git(git_exe, repo_path, ["submodule", "update", "--init", "--recursive"], timeout=300)
+
+
+def lfs_info(git_exe, repo_path):
+    """Detect Git LFS use even when the optional ``git-lfs`` binary is absent."""
+    attributes_path = os.path.join(os.fspath(repo_path), ".gitattributes")
+    attribute_use = False
+    if os.path.isfile(attributes_path):
+        try:
+            with open(attributes_path, encoding="utf-8", errors="replace") as attributes:
+                attribute_use = any("filter=lfs" in line for line in attributes)
+        except OSError:
+            pass
+    files = []
+    lfs_available = False
+    try:
+        output = run_git(git_exe, repo_path, ["lfs", "ls-files", "--name-only"], timeout=60)
+        files = [line for line in output.splitlines() if line.strip()]
+        lfs_available = True
+    except (GitCommandError, FileNotFoundError):
+        pass
+    return {"enabled": bool(attribute_use or files), "lfs_available": lfs_available, "files": files}
+
+
+def rebase_commits(git_exe, repo_path, count=10):
+    """Return recent commits oldest-first for a safe, bounded interactive plan."""
+    count = max(1, min(int(count), 200))
+    output = run_git(git_exe, repo_path, ["log", f"-{count}", "--format=%H%x09%s"])
+    commits = []
+    for line in reversed(output.splitlines()):
+        sha, _, subject = line.partition("\t")
+        if sha:
+            commits.append({"sha": sha, "subject": subject})
+    return commits
+
+
+def build_rebase_todo(commits):
+    """Serialize normalized commit records to editable Git rebase todo text."""
+    lines = ["# Edit actions: pick, reword, squash, fixup, or drop", ""]
+    lines.extend(f"pick {commit['sha']} {commit['subject']}" for commit in commits)
+    return "\n".join(lines) + "\n"
+
+
+def parse_rebase_todo(todo_text):
+    """Parse a user-edited todo file and reject malformed or unsafe commands."""
+    allowed = {"pick", "reword", "squash", "fixup", "drop"}
+    entries = []
+    for line in todo_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split(None, 2)
+        if len(parts) < 2 or parts[0] not in allowed or len(parts[1]) < 7:
+            raise ValueError(f"Invalid rebase todo line: {line}")
+        entries.append({"operation": parts[0], "sha": parts[1], "subject": parts[2] if len(parts) > 2 else ""})
+    if not entries:
+        raise ValueError("Rebase todo must contain at least one commit")
+    return entries
+
+
+def apply_rebase_todo(git_exe, repo_path, todo_text):
+    """Apply an edited todo non-interactively while preserving message edits.
+
+    Git still performs the normal rebase validation and conflict handling. If a
+    conflict occurs, the command raises with the repository left in Git's normal
+    rebase state so the user can resolve it or run ``rebase --abort``.
+    """
+    entries = parse_rebase_todo(todo_text)
+    with tempfile.TemporaryDirectory(prefix="gitforge-rebase-") as temp_dir:
+        temp_path = Path(temp_dir)
+        plan_path = temp_path / "todo"
+        queue_path = temp_path / "messages.json"
+        sequence_script = temp_path / "sequence_editor.py"
+        message_script = temp_path / "message_editor.py"
+        plan_path.write_text("\n".join(
+            f"{entry['operation']} {entry['sha']} {entry['subject']}" for entry in entries
+        ) + "\n", encoding="utf-8")
+        messages = [entry["subject"] for entry in entries if entry["operation"] == "reword"]
+        queue_path.write_text(json.dumps(messages), encoding="utf-8")
+        sequence_script.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text(encoding='utf-8'), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        message_script.write_text(
+            "from pathlib import Path\n"
+            "import json\n"
+            "import sys\n"
+            "queue = Path(sys.argv[1])\n"
+            "message = Path(sys.argv[2])\n"
+            "items = json.loads(queue.read_text(encoding='utf-8'))\n"
+            "if items:\n"
+            "    message.write_text(items.pop(0) + '\\n', encoding='utf-8')\n"
+            "    queue.write_text(json.dumps(items), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["GIT_SEQUENCE_EDITOR"] = subprocess.list2cmdline([
+            sys.executable, os.fspath(sequence_script), os.fspath(plan_path), "PLACEHOLDER"
+        ]).replace(" PLACEHOLDER", "")
+        env["GIT_EDITOR"] = subprocess.list2cmdline([
+            sys.executable, os.fspath(message_script), os.fspath(queue_path)
+        ])
+        base = f"HEAD~{len(entries)}"
+        return run_git(git_exe, repo_path, ["rebase", "-i", base], timeout=600, env=env)
+
+
+def cherry_pick_across_repos(git_exe, source_repo, target_repo, commit):
+    """Transfer one commit as an mbox patch so repositories need not share objects."""
+    patch_result = subprocess.run(
+        [git_exe, "-C", os.fspath(source_repo), "format-patch", "-1", "--stdout", commit],
+        capture_output=True, timeout=120,
+    )
+    if patch_result.returncode != 0:
+        raise GitCommandError(patch_result.args, patch_result.returncode, patch_result.stderr.decode(errors="replace"))
+    apply_result = subprocess.run(
+        [git_exe, "-C", os.fspath(target_repo), "am", "--3way", "--keep-cr"],
+        input=patch_result.stdout, capture_output=True, timeout=180,
+    )
+    if apply_result.returncode != 0:
+        raise GitCommandError(
+            apply_result.args, apply_result.returncode,
+            apply_result.stderr.decode(errors="replace"), apply_result.stdout.decode(errors="replace"),
+        )
+    return apply_result.stdout.decode(errors="replace").strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3249,6 +3485,298 @@ class DiffTab(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB: LOCAL OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+class LocalOpsTab(QWidget):
+    """Worktrees, submodules, LFS, rebase plans, and cross-repo cherry-picks."""
+
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, app_state):
+        super().__init__()
+        self.app = app_state
+        self.repo_paths = []
+        self.init_ui()
+        self.refresh_repos()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        top = QHBoxLayout()
+        refresh = QPushButton("Refresh Local Repos")
+        refresh.clicked.connect(self.refresh_repos)
+        top.addWidget(refresh)
+        self.repo_count = QLabel("No local repositories loaded")
+        self.repo_count.setProperty("class", "subtitle")
+        top.addWidget(self.repo_count)
+        top.addStretch()
+        layout.addLayout(top)
+
+        worktree_group = QGroupBox("  Worktree Manager")
+        worktree_layout = QVBoxLayout(worktree_group)
+        worktree_controls = QHBoxLayout()
+        worktree_controls.addWidget(QLabel("Repository:"))
+        self.worktree_repo = QComboBox()
+        worktree_controls.addWidget(self.worktree_repo, 1)
+        worktree_controls.addWidget(QLabel("Path:"))
+        self.worktree_path = QLineEdit()
+        self.worktree_path.setPlaceholderText("Folder for the new worktree")
+        worktree_controls.addWidget(self.worktree_path, 1)
+        worktree_controls.addWidget(QLabel("Branch:"))
+        self.worktree_branch = QLineEdit()
+        self.worktree_branch.setPlaceholderText("branch-name")
+        worktree_controls.addWidget(self.worktree_branch, 1)
+        self.worktree_new_branch = QCheckBox("Create branch")
+        self.worktree_new_branch.setChecked(True)
+        worktree_controls.addWidget(self.worktree_new_branch)
+        list_btn = QPushButton("List")
+        list_btn.setProperty("class", "secondary")
+        list_btn.clicked.connect(self.load_worktrees)
+        worktree_controls.addWidget(list_btn)
+        create_btn = QPushButton("Create")
+        create_btn.setProperty("class", "success")
+        create_btn.clicked.connect(self.create_worktree)
+        worktree_controls.addWidget(create_btn)
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.setProperty("class", "danger")
+        remove_btn.clicked.connect(self.remove_worktree)
+        worktree_controls.addWidget(remove_btn)
+        worktree_layout.addLayout(worktree_controls)
+        self.worktree_table = make_table([
+            ("Path", 0, "stretch"), ("Branch", 180, "fixed"), ("HEAD", 90, "fixed"), ("State", 90, "fixed")
+        ])
+        self.worktree_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.worktree_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        worktree_layout.addWidget(self.worktree_table)
+        layout.addWidget(worktree_group)
+
+        submodule_group = QGroupBox("  Submodule Dashboard")
+        submodule_layout = QVBoxLayout(submodule_group)
+        submodule_controls = QHBoxLayout()
+        submodule_controls.addWidget(QLabel("Repository:"))
+        self.submodule_repo = QComboBox()
+        submodule_controls.addWidget(self.submodule_repo, 1)
+        sub_refresh = QPushButton("Refresh Status")
+        sub_refresh.setProperty("class", "secondary")
+        sub_refresh.clicked.connect(self.load_submodules)
+        submodule_controls.addWidget(sub_refresh)
+        sub_update = QPushButton("Init / Update All")
+        sub_update.setProperty("class", "success")
+        sub_update.clicked.connect(self.update_submodules)
+        submodule_controls.addWidget(sub_update)
+        submodule_layout.addLayout(submodule_controls)
+        self.submodule_table = make_table([
+            ("Path", 0, "stretch"), ("Commit", 100, "fixed"), ("Status", 120, "fixed"), ("Description", 0, "stretch")
+        ])
+        submodule_layout.addWidget(self.submodule_table)
+        layout.addWidget(submodule_group)
+
+        transfer_group = QGroupBox("  Cherry-pick Across Repositories")
+        transfer_layout = QHBoxLayout(transfer_group)
+        transfer_layout.addWidget(QLabel("Source:"))
+        self.cherry_source = QComboBox()
+        transfer_layout.addWidget(self.cherry_source, 1)
+        transfer_layout.addWidget(QLabel("Commit:"))
+        self.cherry_commit = QLineEdit()
+        self.cherry_commit.setPlaceholderText("SHA-1 or ref")
+        transfer_layout.addWidget(self.cherry_commit, 1)
+        transfer_layout.addWidget(QLabel("Target:"))
+        self.cherry_target = QComboBox()
+        transfer_layout.addWidget(self.cherry_target, 1)
+        cherry_btn = QPushButton("Apply Patch")
+        cherry_btn.setProperty("class", "warning")
+        cherry_btn.clicked.connect(self.cherry_pick)
+        transfer_layout.addWidget(cherry_btn)
+        layout.addWidget(transfer_group)
+
+        rebase_group = QGroupBox("  Interactive Rebase Plan")
+        rebase_layout = QVBoxLayout(rebase_group)
+        rebase_controls = QHBoxLayout()
+        rebase_controls.addWidget(QLabel("Repository:"))
+        self.rebase_repo = QComboBox()
+        rebase_controls.addWidget(self.rebase_repo, 1)
+        rebase_controls.addWidget(QLabel("Commits:"))
+        self.rebase_count = QSpinBox()
+        self.rebase_count.setRange(1, 200)
+        self.rebase_count.setValue(10)
+        rebase_controls.addWidget(self.rebase_count)
+        load_rebase = QPushButton("Load Plan")
+        load_rebase.setProperty("class", "secondary")
+        load_rebase.clicked.connect(self.load_rebase)
+        rebase_controls.addWidget(load_rebase)
+        apply_rebase = QPushButton("Apply Plan")
+        apply_rebase.setProperty("class", "warning")
+        apply_rebase.clicked.connect(self.apply_rebase)
+        rebase_controls.addWidget(apply_rebase)
+        rebase_layout.addLayout(rebase_controls)
+        self.rebase_editor = QPlainTextEdit()
+        self.rebase_editor.setPlaceholderText("Load a plan, then edit pick/reword/squash/fixup/drop actions here.")
+        self.rebase_editor.setMinimumHeight(110)
+        self.rebase_editor.setFont(QFont("Consolas", 9) if sys.platform == "win32" else QFont("Monospace", 9))
+        rebase_layout.addWidget(self.rebase_editor)
+        layout.addWidget(rebase_group)
+
+        lfs_group = QGroupBox("  Git LFS Awareness")
+        lfs_layout = QVBoxLayout(lfs_group)
+        lfs_controls = QHBoxLayout()
+        lfs_controls.addWidget(QLabel("Detect LFS filters and tracked files across local repos."))
+        lfs_controls.addStretch()
+        lfs_scan = QPushButton("Scan LFS")
+        lfs_scan.setProperty("class", "secondary")
+        lfs_scan.clicked.connect(self.scan_lfs)
+        lfs_controls.addWidget(lfs_scan)
+        lfs_layout.addLayout(lfs_controls)
+        self.lfs_table = make_table([
+            ("Repository", 0, "stretch"), ("Enabled", 80, "fixed"), ("git-lfs", 80, "fixed"), ("Tracked Files", 100, "fixed")
+        ])
+        lfs_layout.addWidget(self.lfs_table)
+        layout.addWidget(lfs_group)
+
+    def log(self, message):
+        self.log_signal.emit(message)
+
+    def refresh_repos(self):
+        self.repo_paths = discover_local_repos(self.app.repos_dir)
+        combos = [self.worktree_repo, self.submodule_repo, self.cherry_source, self.cherry_target, self.rebase_repo]
+        for combo in combos:
+            combo.blockSignals(True)
+            combo.clear()
+            for path in self.repo_paths:
+                display = os.path.relpath(path, self.app.repos_dir) if self.app.repos_dir else path
+                combo.addItem(display, path)
+            combo.blockSignals(False)
+        self.repo_count.setText(f"{len(self.repo_paths)} local repositories")
+
+    @staticmethod
+    def _repo_path(combo):
+        return combo.currentData()
+
+    def load_worktrees(self):
+        repo = self._repo_path(self.worktree_repo)
+        if not repo:
+            return
+        try:
+            worktrees = list_worktrees(self.app.git_exe, repo)
+            self.worktree_table.setRowCount(len(worktrees))
+            for row, worktree in enumerate(worktrees):
+                self.worktree_table.setItem(row, 0, QTableWidgetItem(worktree["path"]))
+                self.worktree_table.setItem(row, 1, QTableWidgetItem(worktree["branch"] or "(detached)"))
+                self.worktree_table.setItem(row, 2, QTableWidgetItem(worktree["head"][:10]))
+                state = "Locked" if worktree["locked"] else ("Bare" if worktree["bare"] else "Ready")
+                self.worktree_table.setItem(row, 3, QTableWidgetItem(state))
+        except Exception as error:
+            self.log(f"Worktree error: {error}")
+
+    def create_worktree(self):
+        repo = self._repo_path(self.worktree_repo)
+        path = self.worktree_path.text().strip()
+        branch = self.worktree_branch.text().strip()
+        if not repo or not path or not branch:
+            self.log("Worktree creation requires a repository, path, and branch.")
+            return
+        try:
+            create_worktree(self.app.git_exe, repo, path, branch, self.worktree_new_branch.isChecked())
+            self.log(f"Created worktree {path} on {branch}")
+            self.load_worktrees()
+        except Exception as error:
+            self.log(f"Worktree error: {error}")
+
+    def remove_worktree(self):
+        repo = self._repo_path(self.worktree_repo)
+        row = self.worktree_table.currentRow()
+        path_item = self.worktree_table.item(row, 0) if row >= 0 else None
+        if not repo or not path_item:
+            return
+        if QMessageBox.question(self, "Remove Worktree", f"Remove worktree:\n{path_item.text()}?") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            remove_worktree(self.app.git_exe, repo, path_item.text())
+            self.log(f"Removed worktree {path_item.text()}")
+            self.load_worktrees()
+        except Exception as error:
+            self.log(f"Worktree error: {error}")
+
+    def load_submodules(self):
+        repo = self._repo_path(self.submodule_repo)
+        if not repo:
+            return
+        try:
+            modules = list_submodules(self.app.git_exe, repo)
+            self.submodule_table.setRowCount(len(modules))
+            for row, module in enumerate(modules):
+                self.submodule_table.setItem(row, 0, QTableWidgetItem(module["path"]))
+                self.submodule_table.setItem(row, 1, QTableWidgetItem(module["commit"][:10]))
+                self.submodule_table.setItem(row, 2, QTableWidgetItem(module["status"]))
+                self.submodule_table.setItem(row, 3, QTableWidgetItem(module["description"]))
+        except Exception as error:
+            self.log(f"Submodule error: {error}")
+
+    def update_submodules(self):
+        repo = self._repo_path(self.submodule_repo)
+        if not repo:
+            return
+        try:
+            update_submodules(self.app.git_exe, repo)
+            self.log(f"Updated submodules in {repo}")
+            self.load_submodules()
+        except Exception as error:
+            self.log(f"Submodule error: {error}")
+
+    def cherry_pick(self):
+        source = self._repo_path(self.cherry_source)
+        target = self._repo_path(self.cherry_target)
+        commit = self.cherry_commit.text().strip()
+        if not source or not target or source == target or not commit:
+            self.log("Cherry-pick requires distinct source/target repositories and a commit.")
+            return
+        try:
+            cherry_pick_across_repos(self.app.git_exe, source, target, commit)
+            self.log(f"Cherry-picked {commit} from {source} into {target}")
+        except Exception as error:
+            self.log(f"Cherry-pick error: {error}")
+
+    def load_rebase(self):
+        repo = self._repo_path(self.rebase_repo)
+        if not repo:
+            return
+        try:
+            commits = rebase_commits(self.app.git_exe, repo, self.rebase_count.value())
+            self.rebase_editor.setPlainText(build_rebase_todo(commits))
+            self.log(f"Loaded {len(commits)} commits for rebase planning")
+        except Exception as error:
+            self.log(f"Rebase error: {error}")
+
+    def apply_rebase(self):
+        repo = self._repo_path(self.rebase_repo)
+        if not repo or not self.rebase_editor.toPlainText().strip():
+            return
+        if QMessageBox.question(self, "Apply Interactive Rebase", "Apply this rebase plan? A conflict may require manual resolution.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            apply_rebase_todo(self.app.git_exe, repo, self.rebase_editor.toPlainText())
+            self.log(f"Interactive rebase completed for {repo}")
+        except Exception as error:
+            self.log(f"Rebase error: {error}")
+
+    def scan_lfs(self):
+        self.lfs_table.setRowCount(len(self.repo_paths))
+        for row, repo in enumerate(self.repo_paths):
+            try:
+                info = lfs_info(self.app.git_exe, repo)
+                enabled = "Yes" if info["enabled"] else "No"
+                available = "Yes" if info["lfs_available"] else "No"
+                count = str(len(info["files"]))
+            except Exception as error:
+                self.log(f"LFS error in {repo}: {error}")
+                enabled, available, count = "Error", "No", "0"
+            self.lfs_table.setItem(row, 0, QTableWidgetItem(os.path.basename(repo)))
+            self.lfs_table.setItem(row, 1, QTableWidgetItem(enabled))
+            self.lfs_table.setItem(row, 2, QTableWidgetItem(available))
+            self.lfs_table.setItem(row, 3, QTableWidgetItem(count))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════════════════
 class AppState:
@@ -3343,6 +3871,10 @@ class MainWindow(QMainWindow):
         self.diff_tab = DiffTab(self.state)
         self.diff_tab.log_signal.connect(self.log)
         self.tabs.addTab(self.diff_tab, "Diff Viewer")
+
+        self.local_ops_tab = LocalOpsTab(self.state)
+        self.local_ops_tab.log_signal.connect(self.log)
+        self.tabs.addTab(self.local_ops_tab, "Local Ops")
 
         self.backup_tab = BackupTab(self.state)
         self.backup_tab.log_signal.connect(self.log)
