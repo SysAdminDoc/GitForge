@@ -1,5 +1,6 @@
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 import gitforge
 
@@ -238,4 +239,14 @@ def test_commit_heatmap_and_top_contributors_aggregate_local_history(tmp_path):
     assert sum(heatmap["aggregate"].values()) == 2
     assert contributors[0]["email"] == "test@example.invalid"
     assert contributors[0]["commits"] == 2
+
+
+def test_token_rotation_reminder_and_theme_palettes_are_deterministic():
+    now = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    created = (now - timedelta(days=91)).isoformat()
+
+    assert gitforge.token_age_days(created, now=now) == 91
+    assert "Rotate it" in gitforge.token_rotation_message(created, now=now)
+    assert "rotation reminder" in gitforge.token_rotation_message((now - timedelta(days=10)).isoformat(), now=now)
+    assert "#0d1117" in gitforge.theme_style("GitHub Dark")
 

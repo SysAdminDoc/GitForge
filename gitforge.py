@@ -59,10 +59,10 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFileDialog, QProgressBar,
     QTextEdit, QPlainTextEdit, QCheckBox, QGroupBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QMessageBox, QSplitter, QFrame,
-    QTabWidget, QComboBox, QSpinBox, QToolButton, QStatusBar
+    QTabWidget, QComboBox, QSpinBox, QToolButton, QStatusBar, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QFont, QColor, QTextCursor, QIcon
+from PyQt6.QtGui import QFont, QColor, QTextCursor, QIcon, QKeySequence, QShortcut
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CRASH LOGGING
@@ -98,6 +98,31 @@ def load_config():
 def save_config(cfg):
     cfg_file = os.path.join(get_config_dir(), 'config.json')
     with open(cfg_file, 'w') as f: json.dump(cfg, f, indent=2)
+
+
+def token_age_days(created_at, now=None):
+    """Return token age in whole days, or ``None`` when no timestamp exists."""
+    if not created_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return max(0, (current - parsed).days)
+    except (TypeError, ValueError):
+        return None
+
+
+def token_rotation_message(created_at, threshold_days=90, now=None):
+    age = token_age_days(created_at, now=now)
+    if age is None:
+        return "Token age not recorded; save the token once to start rotation reminders."
+    if age >= threshold_days:
+        return f"Token is {age} days old. Rotate it and confirm account 2FA is enabled."
+    return f"Token age: {age} days (rotation reminder at {threshold_days} days)."
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GIT DETECTION
@@ -1297,9 +1322,93 @@ QFrame[class="card"] {
 }
 """
 
+THEME_PALETTES = {
+    "Catppuccin Mocha": {},
+    "GitHub Dark": {
+        "#1e1e2e": "#0d1117", "#181825": "#161b22", "#313244": "#21262d",
+        "#45475a": "#30363d", "#585b70": "#484f58", "#cdd6f4": "#c9d1d9",
+        "#a6adc8": "#8b949e", "#6c7086": "#8b949e", "#89b4fa": "#58a6ff",
+        "#74c7ec": "#79c0ff", "#89dceb": "#a5d6ff", "#a6e3a1": "#3fb950",
+        "#94e2d5": "#56d364", "#f38ba8": "#f85149", "#eba0ac": "#ff7b72",
+        "#fab387": "#d29922", "#f9e2af": "#e3b341", "#cba6f7": "#bc8cff",
+        "#1e1e3e": "#1c2430", "#1a2e1a": "#12261e", "#2e1a1a": "#2d1619",
+        "#11111b": "#010409",
+    },
+    "Nord": {
+        "#1e1e2e": "#2e3440", "#181825": "#242933", "#313244": "#3b4252",
+        "#45475a": "#4c566a", "#585b70": "#616e88", "#cdd6f4": "#eceff4",
+        "#a6adc8": "#d8dee9", "#6c7086": "#a4adbf", "#89b4fa": "#88c0d0",
+        "#74c7ec": "#8fbcbb", "#89dceb": "#81a1c1", "#a6e3a1": "#a3be8c",
+        "#94e2d5": "#8fbcbb", "#f38ba8": "#bf616a", "#eba0ac": "#d08770",
+        "#fab387": "#d08770", "#f9e2af": "#ebcb8b", "#cba6f7": "#b48ead",
+        "#1e1e3e": "#353b49", "#1a2e1a": "#304238", "#2e1a1a": "#433238",
+        "#11111b": "#20242d",
+    },
+    "Solarized Dark": {
+        "#1e1e2e": "#002b36", "#181825": "#073642", "#313244": "#0b3d46",
+        "#45475a": "#586e75", "#585b70": "#657b83", "#cdd6f4": "#eee8d5",
+        "#a6adc8": "#93a1a1", "#6c7086": "#839496", "#89b4fa": "#268bd2",
+        "#74c7ec": "#2aa198", "#89dceb": "#2aa198", "#a6e3a1": "#859900",
+        "#94e2d5": "#2aa198", "#f38ba8": "#dc322f", "#eba0ac": "#cb4b16",
+        "#fab387": "#cb4b16", "#f9e2af": "#b58900", "#cba6f7": "#6c71c4",
+        "#1e1e3e": "#073642", "#1a2e1a": "#173f3a", "#2e1a1a": "#421f25",
+        "#11111b": "#00212b",
+    },
+}
+
+
+def theme_style(theme_name):
+    """Return a complete stylesheet for a named, persisted palette."""
+    style = DARK_STYLE
+    for source, target in THEME_PALETTES.get(theme_name, {}).items():
+        style = style.replace(source, target)
+    return style
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPER: Styled table with checkboxes
 # ═══════════════════════════════════════════════════════════════════════════════
+def _table_profile_key(table):
+    labels = [table.horizontalHeaderItem(index).text() if table.horizontalHeaderItem(index) else str(index)
+              for index in range(table.columnCount())]
+    return "|".join(labels)
+
+
+def _save_table_profile(table, key):
+    config = load_config()
+    profiles = config.setdefault("table_columns", {})
+    profiles[key] = [not table.isColumnHidden(index) for index in range(table.columnCount())]
+    save_config(config)
+
+
+def _show_table_column_menu(table, key, point):
+    header = table.horizontalHeader()
+    menu = QMenu(table)
+    actions = []
+    visible_count = sum(not table.isColumnHidden(index) for index in range(table.columnCount()))
+    for index in range(table.columnCount()):
+        item = table.horizontalHeaderItem(index)
+        action = menu.addAction(item.text() if item else f"Column {index + 1}")
+        action.setCheckable(True)
+        action.setChecked(not table.isColumnHidden(index))
+        action.setData(index)
+        actions.append(action)
+
+    chosen = menu.exec(header.viewport().mapToGlobal(point))
+    if chosen is None:
+        return
+    index = chosen.data()
+    if chosen.isChecked() or visible_count > 1:
+        table.setColumnHidden(index, not chosen.isChecked())
+        _save_table_profile(table, key)
+
+
+def _restore_table_profile(table, key):
+    profile = load_config().get("table_columns", {}).get(key)
+    if isinstance(profile, list):
+        for index, visible in enumerate(profile[:table.columnCount()]):
+            table.setColumnHidden(index, not bool(visible))
+
+
 def make_table(columns, checkbox_col=None):
     t = QTableWidget()
     t.setColumnCount(len(columns))
@@ -1311,9 +1420,15 @@ def make_table(columns, checkbox_col=None):
             t.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeMode.Fixed)
             t.setColumnWidth(i, width)
     t.setAlternatingRowColors(True)
-    t.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+    t.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+    t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     t.verticalHeader().setVisible(False)
     t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    profile_key = _table_profile_key(t)
+    _restore_table_profile(t, profile_key)
+    t.horizontalHeader().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    t.horizontalHeader().customContextMenuRequested.connect(
+        lambda point, table=t, key=profile_key: _show_table_column_menu(table, key, point))
     return t
 
 def add_checkbox_to_table(table, row, col, checked=True):
@@ -4663,6 +4778,13 @@ class MainWindow(QMainWindow):
         ver.setProperty("class", "subtitle")
         ver.setStyleSheet("color: #6c7086; font-size: 11px; padding-top: 8px;")
         header.addWidget(ver)
+        self.palette_box = QComboBox()
+        self.palette_box.setEditable(True)
+        self.palette_box.setFixedWidth(250)
+        self.palette_box.setPlaceholderText("Ctrl+K actions")
+        self.palette_box.setVisible(False)
+        self.palette_box.lineEdit().returnPressed.connect(self._execute_palette)
+        header.addWidget(self.palette_box)
         header.addStretch()
         self.git_label = QLabel()
         header.addWidget(self.git_label)
@@ -4713,6 +4835,8 @@ class MainWindow(QMainWindow):
         self.advanced_api_tab = AdvancedAPITab(self.state)
         self.advanced_api_tab.log_signal.connect(self.log)
         self.tabs.addTab(self.advanced_api_tab, "Advanced API")
+
+        self._init_palette()
 
         splitter.addWidget(self.tabs)
 
@@ -4801,6 +4925,10 @@ class MainWindow(QMainWindow):
         self.token_input.textChanged.connect(self._save_settings)
         row.addWidget(self.token_input, 1)
         cl.addLayout(row)
+        self.token_status_label = QLabel()
+        self.token_status_label.setWordWrap(True)
+        self.token_status_label.setProperty("class", "subtitle")
+        cl.addWidget(self.token_status_label)
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Local Repos Folder:"))
         self.repos_dir_input = QLineEdit()
@@ -4814,6 +4942,17 @@ class MainWindow(QMainWindow):
         row2.addWidget(browse)
         cl.addLayout(row2)
         layout.addWidget(conn)
+
+        appearance = QGroupBox("  Appearance")
+        al = QHBoxLayout(appearance)
+        al.addWidget(QLabel("Dark theme:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(THEME_PALETTES.keys()))
+        self.theme_combo.currentTextChanged.connect(self._theme_changed)
+        al.addWidget(self.theme_combo)
+        al.addWidget(QLabel("Right-click any table header to show or hide columns; visibility is saved per profile."))
+        al.addStretch()
+        layout.addWidget(appearance)
 
         # Git config
         git = QGroupBox("  Git Configuration")
@@ -4845,17 +4984,30 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self):
         cfg = self.state.config
+        restore_widgets = [
+            self.provider_combo, self.provider_base_input, self.provider_namespace_input,
+            self.username_input, self.token_input, self.repos_dir_input, self.theme_combo,
+        ]
+        for widget in restore_widgets:
+            widget.blockSignals(True)
         provider_id = (cfg.get("provider") or "github").lower()
         provider_index = self.provider_combo.findData(provider_id)
         if provider_index >= 0:
-            self.provider_combo.blockSignals(True)
             self.provider_combo.setCurrentIndex(provider_index)
-            self.provider_combo.blockSignals(False)
         self.provider_base_input.setText(cfg.get("provider_base_url", ""))
         self.provider_namespace_input.setText(cfg.get("provider_namespace", ""))
         self.username_input.setText(cfg.get("username", ""))
         self.token_input.setText(cfg.get("token", ""))
         self.repos_dir_input.setText(cfg.get("repos_dir", ""))
+        theme = cfg.get("theme", "Catppuccin Mocha")
+        if self.theme_combo.findText(theme) < 0:
+            theme = "Catppuccin Mocha"
+        self.theme_combo.setCurrentText(theme)
+        for widget in restore_widgets:
+            widget.blockSignals(False)
+        self.state.refresh_provider()
+        self._apply_theme(theme)
+        self._update_token_status()
 
         # Git config
         if self.state.git_exe:
@@ -4885,14 +5037,76 @@ class MainWindow(QMainWindow):
             self.git_info_label.setStyleSheet("color: #f38ba8;")
 
     def _save_settings(self):
+        old_token = self.state.config.get("token", "")
+        new_token = self.token_input.text().strip()
         self.state.config["provider"] = self.provider_combo.currentData() or "github"
         self.state.config["provider_base_url"] = self.provider_base_input.text().strip()
         self.state.config["provider_namespace"] = self.provider_namespace_input.text().strip()
         self.state.config["username"] = self.username_input.text().strip()
-        self.state.config["token"] = self.token_input.text().strip()
+        self.state.config["token"] = new_token
         self.state.config["repos_dir"] = self.repos_dir_input.text().strip()
+        if new_token and new_token != old_token:
+            self.state.config["token_created_at"] = datetime.now(timezone.utc).isoformat()
+        elif not new_token:
+            self.state.config.pop("token_created_at", None)
         save_config(self.state.config)
         self.state.refresh_provider()
+        self._update_token_status()
+
+    def _update_token_status(self):
+        created_at = self.state.config.get("token_created_at")
+        self.token_status_label.setText(token_rotation_message(created_at))
+        age = token_age_days(created_at)
+        if age is not None and age >= 90:
+            self.token_status_label.setStyleSheet("color: #f38ba8; font-weight: bold;")
+        else:
+            self.token_status_label.setStyleSheet("color: #6c7086;")
+
+    def _apply_theme(self, theme):
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(theme_style(theme))
+
+    def _theme_changed(self, theme):
+        if not theme:
+            return
+        self.state.config["theme"] = theme
+        save_config(self.state.config)
+        self._apply_theme(theme)
+
+    def _init_palette(self):
+        self.palette_commands = {
+            "Scan local repositories": self.sync_tab.scan_repos,
+            "Fetch remote repositories": self.clone_tab.fetch_repos,
+            "Scan diffs": self.diff_tab.scan_all,
+            "Refresh insights": self.insights_tab.refresh,
+            "Refresh Local Ops repositories": self.local_ops_tab.refresh_repos,
+            "List GitHub workflows": self.advanced_api_tab.list_workflows,
+        }
+        self.palette_box.clear()
+        self.palette_box.addItems(list(self.palette_commands))
+        self.palette_box.setCurrentIndex(-1)
+        shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        shortcut.activated.connect(self._show_palette)
+        self.palette_shortcut = shortcut
+
+    def _show_palette(self):
+        self.palette_box.setVisible(True)
+        self.palette_box.setCurrentIndex(-1)
+        self.palette_box.lineEdit().clear()
+        self.palette_box.setFocus()
+        self.palette_box.showPopup()
+
+    def _execute_palette(self):
+        command = self.palette_box.currentText().strip()
+        action = self.palette_commands.get(command)
+        self.palette_box.hidePopup()
+        self.palette_box.clearFocus()
+        self.palette_box.setVisible(False)
+        if action:
+            self.log(f"Palette: {command}")
+            action()
 
     def _provider_changed(self):
         provider_id = self.provider_combo.currentData() or "github"
@@ -4960,7 +5174,7 @@ def main():
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
     app.setStyle("Fusion")
-    app.setStyleSheet(DARK_STYLE)
+    app.setStyleSheet(theme_style(load_config().get("theme", "Catppuccin Mocha")))
     font = app.font()
     font.setPointSize(10)
     app.setFont(font)
