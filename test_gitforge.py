@@ -148,6 +148,19 @@ def test_github_advanced_api_methods_preserve_payloads_and_redact_scope():
     assert "/branches/release%2F3/protection" in session.calls[1][1]
 
 
+def test_github_namespace_fetch_merges_personal_and_org_repositories():
+    session = FakeSession([
+        FakeResponse([{"name": "personal", "full_name": "alice/personal", "private": False, "fork": False, "clone_url": "https://example/personal.git", "ssh_url": "git@example:personal.git", "html_url": "https://example/personal"}]),
+        FakeResponse([{"name": "shared", "full_name": "team/shared", "private": True, "fork": False, "clone_url": "https://example/shared.git", "ssh_url": "git@example:shared.git", "html_url": "https://example/shared"}]),
+    ])
+    api = gitforge.GitHubAPI("alice", "token", namespace="team", session=session)
+
+    repos = api.fetch_all_repos()
+
+    assert {repo["full_name"] for repo in repos} == {"alice/personal", "team/shared"}
+    assert session.calls[1][1].endswith("/orgs/team/repos")
+
+
 def _init_repo(path, git):
     subprocess.run([git, "init", "-b", "main", str(path)], check=True, capture_output=True)
     gitforge.run_git(git, path, ["config", "user.name", "Test User"])
@@ -249,4 +262,35 @@ def test_token_rotation_reminder_and_theme_palettes_are_deterministic():
     assert "Rotate it" in gitforge.token_rotation_message(created, now=now)
     assert "rotation reminder" in gitforge.token_rotation_message((now - timedelta(days=10)).isoformat(), now=now)
     assert "#0d1117" in gitforge.theme_style("GitHub Dark")
+
+
+def test_cache_queue_script_runner_and_template_deploy(tmp_path):
+    cache_dir = tmp_path / "cache"
+    repos = [{"name": "one", "full_name": "alice/one"}]
+    gitforge.save_repo_cache("github", "alice", repos, str(cache_dir))
+    assert gitforge.load_repo_cache("github", "alice", str(cache_dir)) == repos
+
+    queue_dir = tmp_path / "queue"
+    gitforge.queue_offline_action("github", "alice", "PATCH", "/repos/alice/one", {"archived": True}, str(queue_dir))
+    session = FakeSession([FakeResponse({}, status_code=200)])
+    provider = gitforge.GitHubAPI("alice", "token", session=session)
+    replay = gitforge.replay_offline_queue(provider, "alice", str(queue_dir))
+    assert replay == {"applied": 1, "remaining": 0}
+    assert session.calls[0][0] == "PATCH"
+
+    git = gitforge.find_git()
+    template = tmp_path / "template"
+    target = tmp_path / "target"
+    template.mkdir()
+    target.mkdir()
+    _init_repo(target, git)
+    (template / ".github").mkdir()
+    (template / ".github" / "workflow.yml").write_text("name: CI\n", encoding="utf-8")
+    report = gitforge.deploy_template(str(template), [str(target)], git, commit_message="apply template")
+    assert report[0]["status"] == "committed"
+    assert (target / ".github" / "workflow.yml").is_file()
+
+    result = gitforge.run_script_runner("print(len(repos)); print(git(repos[0], 'status', '--short'))", [str(target)], git, timeout=10)
+    assert result["returncode"] == 0
+    assert result["stdout"].splitlines()[0] == "1"
 

@@ -5,6 +5,7 @@ Clone, sync, backup, search, and manage all your GitHub repos from one tool.
 """
 
 import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch, csv, io, tempfile
+from multiprocessing import freeze_support
 from pathlib import Path
 
 
@@ -123,6 +124,195 @@ def token_rotation_message(created_at, threshold_days=90, now=None):
     if age >= threshold_days:
         return f"Token is {age} days old. Rotate it and confirm account 2FA is enabled."
     return f"Token age: {age} days (rotation reminder at {threshold_days} days)."
+
+
+def _cache_stem(provider_id, identity):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", f"{provider_id}-{identity or 'default'}")
+
+
+def repo_cache_path(provider_id, identity, cache_dir=None):
+    cache_dir = cache_dir or os.path.join(get_config_dir(), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{_cache_stem(provider_id, identity)}.json")
+
+
+def save_repo_cache(provider_id, identity, repos, cache_dir=None):
+    path = repo_cache_path(provider_id, identity, cache_dir)
+    payload = {
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+        "provider": provider_id,
+        "identity": identity,
+        "repos": repos,
+    }
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as cache_file:
+        json.dump(payload, cache_file, indent=2)
+    os.replace(temp_path, path)
+    return path
+
+
+def load_repo_cache(provider_id, identity, cache_dir=None):
+    path = repo_cache_path(provider_id, identity, cache_dir)
+    try:
+        with open(path, encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        return payload.get("repos", [])
+    except (OSError, ValueError):
+        return []
+
+
+def offline_queue_path(queue_dir=None):
+    queue_dir = queue_dir or get_config_dir()
+    os.makedirs(queue_dir, exist_ok=True)
+    return os.path.join(queue_dir, "offline-actions.json")
+
+
+def load_offline_queue(queue_dir=None):
+    try:
+        with open(offline_queue_path(queue_dir), encoding="utf-8") as queue_file:
+            payload = json.load(queue_file)
+        return payload if isinstance(payload, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def queue_offline_action(provider_id, identity, method, endpoint, body=None, queue_dir=None):
+    queue = load_offline_queue(queue_dir)
+    queue.append({
+        "queued_at": datetime.now(timezone.utc).isoformat(), "provider": provider_id,
+        "identity": identity, "method": method.upper(), "endpoint": endpoint, "body": body or {},
+    })
+    path = offline_queue_path(queue_dir)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as queue_file:
+        json.dump(queue, queue_file, indent=2)
+    os.replace(temp_path, path)
+    return len(queue)
+
+
+def replay_offline_queue(provider, identity, queue_dir=None):
+    """Replay matching queued requests and retain failures for a later retry."""
+    queue = load_offline_queue(queue_dir)
+    remaining = []
+    applied = 0
+    for action in queue:
+        if action.get("provider") != provider.provider_id or action.get("identity") != identity:
+            remaining.append(action)
+            continue
+        try:
+            response = provider.request(action["method"], action["endpoint"], data=action.get("body", {}))
+            if response.status_code not in (200, 201, 202, 204):
+                remaining.append(action)
+            else:
+                applied += 1
+        except Exception:
+            remaining.append(action)
+    path = offline_queue_path(queue_dir)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as queue_file:
+        json.dump(remaining, queue_file, indent=2)
+    os.replace(temp_path, path)
+    return {"applied": applied, "remaining": len(remaining)}
+
+
+def run_script_runner(script_text, repo_paths, git_exe, timeout=60, python_executable=None):
+    """Execute a trusted user script with bounded time and no token injection.
+
+    The runner is deliberately explicit: it is not a sandbox. The caller must
+    opt in because Python code runs with the current user's filesystem rights.
+    It does, however, use isolated interpreter mode, a scrubbed environment,
+    argument-list subprocesses, and a hard timeout.
+    """
+    if not script_text.strip():
+        raise ValueError("Script is empty")
+    if len(script_text.encode("utf-8")) > 1024 * 1024:
+        raise ValueError("Script is limited to 1 MiB")
+    python_executable = python_executable or sys.executable
+    repos = [os.path.abspath(os.fspath(path)) for path in repo_paths]
+    with tempfile.TemporaryDirectory(prefix="gitforge-script-") as temp_dir:
+        wrapper_path = Path(temp_dir) / "runner.py"
+        script_literal = repr(script_text)
+        repos_literal = repr(repos)
+        wrapper = (
+            "import json, os, shutil, subprocess\n"
+            "import requests\n"
+            f"repos = {repos_literal}\n"
+            f"script = {script_literal}\n"
+            f"git_exe = {repr(git_exe)}\n"
+            "def git(repo, *args, check=True):\n"
+            "    result = subprocess.run([git_exe, '-C', repo, *map(str, args)], capture_output=True, text=True)\n"
+            "    if check and result.returncode:\n"
+            "        raise RuntimeError(result.stderr.strip() or result.stdout.strip())\n"
+            "    return result.stdout.strip()\n"
+            "def gh(*args, check=True):\n"
+            "    gh_exe = shutil.which('gh')\n"
+            "    if not gh_exe:\n"
+            "        raise RuntimeError('gh CLI is not installed')\n"
+            "    result = subprocess.run([gh_exe, *map(str, args)], capture_output=True, text=True)\n"
+            "    if check and result.returncode:\n"
+            "        raise RuntimeError(result.stderr.strip() or result.stdout.strip())\n"
+            "    return result.stdout.strip()\n"
+            "exec(compile(script, '<gitforge-script>', 'exec'), {'repos': repos, 'git': git, 'gh': gh, 'requests': requests})\n"
+        )
+        wrapper_path.write_text(wrapper, encoding="utf-8")
+        env = os.environ.copy()
+        for secret_name in ("GITHUB_TOKEN", "GH_TOKEN", "GITFORGE_TOKEN", "GITLAB_TOKEN"):
+            env.pop(secret_name, None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        result = subprocess.run(
+            [python_executable, "-I", os.fspath(wrapper_path)],
+            cwd=repos[0] if repos else temp_dir, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=max(1, min(int(timeout), 600)), env=env,
+        )
+        return {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+
+def deploy_template(template_source, repo_paths, git_exe, files=None, commit_message="", push=False, dry_run=False):
+    """Copy a local or Git URL template into selected repos and optionally commit."""
+    source_path = Path(template_source)
+    temporary_source = None
+    if not source_path.is_dir():
+        temporary_source = tempfile.TemporaryDirectory(prefix="gitforge-template-")
+        clone_path = Path(temporary_source.name) / "template"
+        result = subprocess.run(
+            [git_exe, "clone", "--depth", "1", template_source, os.fspath(clone_path)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode:
+            temporary_source.cleanup()
+            raise GitCommandError(result.args, result.returncode, result.stderr, result.stdout)
+        source_path = clone_path
+    allowed = {os.path.normpath(os.fspath(item)) for item in files} if files else None
+    report = []
+    try:
+        for repo_path in repo_paths:
+            repo_path = Path(repo_path)
+            copied = []
+            for source_file in source_path.rglob("*"):
+                if not source_file.is_file() or ".git" in source_file.parts:
+                    continue
+                relative = os.path.normpath(os.fspath(source_file.relative_to(source_path)))
+                if allowed is not None and relative not in allowed:
+                    continue
+                destination = repo_path / relative
+                if not dry_run:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_file, destination)
+                copied.append(relative)
+            status = "planned" if dry_run else "copied"
+            if not dry_run and commit_message and copied:
+                run_git(git_exe, repo_path, ["add", "--", *copied])
+                if run_git(git_exe, repo_path, ["diff", "--cached", "--name-only"]):
+                    run_git(git_exe, repo_path, ["commit", "-m", commit_message], timeout=120)
+                    status = "committed"
+                    if push:
+                        run_git(git_exe, repo_path, ["push"], timeout=180)
+                        status = "pushed"
+            report.append({"repo": os.fspath(repo_path), "status": status, "files": copied})
+    finally:
+        if temporary_source:
+            temporary_source.cleanup()
+    return report
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GIT DETECTION
@@ -288,10 +478,12 @@ class RepositoryProvider:
 
 class GitHubAPI(RepositoryProvider):
     """Centralized GitHub API access with rate-limit awareness."""
+    provider_id = "github"
+    display_name = "GitHub"
     BASE = "https://api.github.com"
 
-    def __init__(self, username="", token="", base_url="", session=None):
-        super().__init__(username, token, base_url or self.BASE, session=session)
+    def __init__(self, username="", token="", base_url="", namespace="", session=None):
+        super().__init__(username, token, base_url or self.BASE, namespace=namespace, session=session)
         self.BASE = self.base_url
         self._rate_remaining = None
         self._rate_reset = None
@@ -363,51 +555,59 @@ class GitHubAPI(RepositoryProvider):
 
     def fetch_all_repos(self, log_cb=None):
         repos = []
-        page = 1
+        sources = []
         if self.token:
-            base_path = "/user/repos"
-            params_base = {"per_page": 100, "affiliation": "owner"}
+            sources.append(("/user/repos", {"per_page": 100, "affiliation": "owner"}))
+        elif self.username:
+            sources.append((f"/users/{self.username}/repos", {"per_page": 100}))
         else:
-            base_path = f"/users/{self.username}/repos"
-            params_base = {"per_page": 100}
+            raise ValueError("GitHub username or token is required")
+        if self.namespace and self.namespace != self.username:
+            sources.append((f"/orgs/{self.namespace}/repos", {"per_page": 100, "type": "all"}))
 
-        while True:
-            params = {**params_base, "page": page}
-            if log_cb: log_cb(f"Fetching page {page}...")
-            resp = self.get(base_path, params)
-            if resp.status_code == 401:
-                raise Exception("Authentication failed. Check your token.")
-            if resp.status_code == 403:
-                raise Exception("Rate limited by GitHub. Try later or add a token.")
-            if resp.status_code != 200:
-                raise Exception(f"GitHub API error {resp.status_code}: {resp.text[:200]}")
-            data = resp.json()
-            if not data: break
-            for r in data:
-                repos.append({
-                    "name": r["name"],
-                    "full_name": r["full_name"],
-                    "description": r.get("description") or "",
-                    "private": r["private"],
-                    "fork": r["fork"],
-                    "archived": r.get("archived", False),
-                    "clone_url": r["clone_url"],
-                    "ssh_url": r["ssh_url"],
-                    "html_url": r["html_url"],
-                    "size": r.get("size", 0),
-                    "language": r.get("language") or "",
-                    "updated_at": r.get("updated_at", ""),
-                    "pushed_at": r.get("pushed_at", ""),
-                    "default_branch": r.get("default_branch", "main"),
-                    "stargazers_count": r.get("stargazers_count", 0),
-                    "forks_count": r.get("forks_count", 0),
-                    "open_issues_count": r.get("open_issues_count", 0),
-                    "topics": r.get("topics", []),
-                    "has_wiki": r.get("has_wiki", False),
-                    "has_issues": r.get("has_issues", True),
-                })
-            if len(data) < 100: break
-            page += 1
+        for base_path, params_base in sources:
+            page = 1
+            while True:
+                params = {**params_base, "page": page}
+                if log_cb:
+                    log_cb(f"Fetching {base_path} page {page}...")
+                resp = self.get(base_path, params)
+                if resp.status_code == 401:
+                    raise Exception("Authentication failed. Check your token.")
+                if resp.status_code == 403:
+                    raise Exception("Rate limited by GitHub. Try later or add a token.")
+                if resp.status_code != 200:
+                    raise Exception(f"GitHub API error {resp.status_code}: {resp.text[:200]}")
+                data = resp.json()
+                if not data:
+                    break
+                for r in data:
+                    repos.append({
+                        "name": r["name"],
+                        "full_name": r["full_name"],
+                        "description": r.get("description") or "",
+                        "private": r["private"],
+                        "fork": r["fork"],
+                        "archived": r.get("archived", False),
+                        "clone_url": r["clone_url"],
+                        "ssh_url": r["ssh_url"],
+                        "html_url": r["html_url"],
+                        "size": r.get("size", 0),
+                        "language": r.get("language") or "",
+                        "updated_at": r.get("updated_at", ""),
+                        "pushed_at": r.get("pushed_at", ""),
+                        "default_branch": r.get("default_branch", "main"),
+                        "stargazers_count": r.get("stargazers_count", 0),
+                        "forks_count": r.get("forks_count", 0),
+                        "open_issues_count": r.get("open_issues_count", 0),
+                        "topics": r.get("topics", []),
+                        "has_wiki": r.get("has_wiki", False),
+                        "has_issues": r.get("has_issues", True),
+                    })
+                if len(data) < 100:
+                    break
+                page += 1
+        repos = list({repo["full_name"]: repo for repo in repos}.values())
         return repos
 
     def _require_success(self, response, expected=(200, 201, 204)):
@@ -795,7 +995,7 @@ def create_provider(config):
         return BitbucketAPI(**kwargs)
     return GitHubAPI(
         username=kwargs["identity"], token=kwargs["token"],
-        base_url=kwargs["base_url"],
+        base_url=kwargs["base_url"], namespace=kwargs["namespace"],
     )
 
 
@@ -1636,6 +1836,17 @@ class CloneTab(QWidget):
         self.clone_btn.setEnabled(False)
         self.table.setRowCount(0)
 
+        if self.app.offline_mode:
+            cached = self.app.load_repo_cache()
+            self.fetch_btn.setEnabled(True)
+            self.fetch_btn.setText(f"Fetch Repos from {self.app.provider_display_name}")
+            if cached:
+                self.log(f"Offline mode: loaded {len(cached)} cached repositories")
+                self._on_fetched(cached)
+            else:
+                self._on_fetch_err("Offline mode is enabled and no cached repository list exists.")
+            return
+
         def do_fetch(progress_cb, log_cb):
             provider = self.app.get_provider()
             return provider.fetch_all_repos(log_cb)
@@ -1647,6 +1858,12 @@ class CloneTab(QWidget):
         self.worker.start()
 
     def _on_fetched(self, repos):
+        if not self.app.offline_mode:
+            try:
+                cache_path = self.app.save_repo_cache(repos)
+                self.log(f"Repository cache saved: {cache_path}")
+            except Exception as error:
+                self.log(f"Cache warning: {error}")
         if not self.include_forks.isChecked():
             repos = [r for r in repos if not r["fork"]]
         self.repos = sorted(repos, key=lambda r: r["name"].lower())
@@ -1660,6 +1877,11 @@ class CloneTab(QWidget):
 
     def _on_fetch_err(self, err):
         self.log(f"ERROR: {err}")
+        cached = self.app.load_repo_cache()
+        if cached:
+            self.log(f"Using {len(cached)} cached repositories after provider error")
+            self._on_fetched(cached)
+            return
         self.fetch_btn.setEnabled(True)
         self.fetch_btn.setText(f"Fetch Repos from {self.app.provider_display_name}")
         QMessageBox.critical(self, "Fetch Error", err)
@@ -3052,6 +3274,10 @@ class APITab(QWidget):
         load_btn = QPushButton("Load Repos")
         load_btn.clicked.connect(self.load_repos)
         actions.addWidget(load_btn)
+        flush_btn = QPushButton("Flush Offline Queue")
+        flush_btn.setProperty("class", "secondary")
+        flush_btn.clicked.connect(self.flush_offline_queue)
+        actions.addWidget(flush_btn)
 
         sel_btn = QPushButton("Select All")
         sel_btn.setProperty("class", "secondary")
@@ -3178,6 +3404,8 @@ class APITab(QWidget):
         if self.app.provider_id != "github":
             QMessageBox.warning(self, "GitHub Provider Required", "Switch the Repository Provider to GitHub for this management tab.")
             return False
+        if self.app.offline_mode:
+            return True
         if not self.app.token:
             QMessageBox.warning(self, "Token Required", "Add a Personal Access Token in Settings.")
             return False
@@ -3238,6 +3466,12 @@ class APITab(QWidget):
             self.log("No changes detected for selected repos.")
             return
 
+        if self.app.offline_mode:
+            for entry in plan:
+                self.app.queue_offline_action(entry["method"], entry["endpoint"], entry["body"])
+            self.log(f"Offline mode: queued {len(plan)} API changes for later replay.")
+            return
+
         # Dry-run mode: show preview only
         if self.dry_run_check.isChecked():
             preview = "DRY RUN - The following API calls would be made:\n\n"
@@ -3292,6 +3526,19 @@ class APITab(QWidget):
             f"Apply complete: {s['ok']} ok, {s['err']} errors | Rate limit: {api.rate_limit_info}"))
         self.worker.error.connect(lambda e: self.log(f"ERROR: {e}"))
         self.worker.start()
+
+    def flush_offline_queue(self):
+        if self.app.offline_mode:
+            self.log("Disable offline mode before flushing queued API changes.")
+            return
+        if not self.app.token:
+            self.log("A token is required to flush queued API changes.")
+            return
+        try:
+            result = self.app.replay_offline_queue()
+            self.log(f"Offline queue replay: {result['applied']} applied, {result['remaining']} remaining")
+        except Exception as error:
+            self.log(f"Offline queue error: {error}")
 
     def archive_selected(self):
         if not self._require_token():
@@ -4178,6 +4425,10 @@ class AdvancedAPITab(QWidget):
         return self.repo_combo.currentData()
 
     def _preview_or_confirm(self, method, endpoint, payload=None):
+        if self.app.offline_mode and method.upper() != "GET":
+            self.app.queue_offline_action(method, endpoint, payload or {})
+            self.log(f"Offline mode: queued {method} {endpoint}")
+            return False
         if self.dry_run.isChecked():
             self.log(f"DRY RUN: {method} {endpoint} {json.dumps(payload or {}, sort_keys=True)}")
             return False
@@ -4355,6 +4606,14 @@ class AdvancedAPITab(QWidget):
             return
         kind = self.action_kind.currentText()
         endpoint = f"/repos/{repo}/actions/{'secrets' if kind == 'Secret' else 'variables'}/{name}"
+        if self.app.offline_mode:
+            if kind == "Secret":
+                self.log("Secrets are not written to the offline queue; connect before upserting a secret.")
+                return
+            self.app.queue_offline_action("PUT", endpoint, {"name": name, "value": value, "visibility": "selected"})
+            self.action_value.clear()
+            self.log(f"Offline mode: queued variable {name}")
+            return
         if not self._preview_or_confirm("PUT", endpoint, {"name": name, "value": "[redacted]"}):
             return
         try:
@@ -4710,6 +4969,207 @@ class LocalOpsTab(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB: AUTOMATION AND TEMPLATE DEPLOYMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+class AutomationTab(QWidget):
+    """Explicitly opt-in script runner and repeatable template deployment."""
+
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, app_state):
+        super().__init__()
+        self.app = app_state
+        self.worker = None
+        self.repo_paths = []
+        self.init_ui()
+        self.refresh_repos()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        repo_group = QGroupBox("  Selected Repositories")
+        repo_layout = QVBoxLayout(repo_group)
+        repo_controls = QHBoxLayout()
+        refresh = QPushButton("Refresh")
+        refresh.setProperty("class", "secondary")
+        refresh.clicked.connect(self.refresh_repos)
+        repo_controls.addWidget(refresh)
+        select_all = QPushButton("Select All")
+        select_all.setProperty("class", "secondary")
+        select_all.clicked.connect(lambda: self._toggle_repos(True))
+        repo_controls.addWidget(select_all)
+        select_none = QPushButton("Deselect All")
+        select_none.setProperty("class", "secondary")
+        select_none.clicked.connect(lambda: self._toggle_repos(False))
+        repo_controls.addWidget(select_none)
+        self.repo_count_label = QLabel()
+        self.repo_count_label.setProperty("class", "subtitle")
+        repo_controls.addWidget(self.repo_count_label)
+        repo_controls.addStretch()
+        repo_layout.addLayout(repo_controls)
+        self.repo_table = make_table([("", 40, "fixed"), ("Repository", 0, "stretch"), ("Path", 0, "stretch")])
+        repo_layout.addWidget(self.repo_table)
+        layout.addWidget(repo_group)
+
+        script_group = QGroupBox("  Script Runner (trusted local code)")
+        script_layout = QVBoxLayout(script_group)
+        script_note = QLabel("Scripts run with the current user's filesystem permissions. GitForge removes token environment variables and enforces a timeout, but this is not a sandbox.")
+        script_note.setWordWrap(True)
+        script_note.setProperty("class", "warn")
+        script_layout.addWidget(script_note)
+        self.script_editor = QPlainTextEdit()
+        self.script_editor.setPlaceholderText("Example: print([git(repo, 'status', '--short') for repo in repos])")
+        self.script_editor.setMinimumHeight(100)
+        script_layout.addWidget(self.script_editor)
+        script_controls = QHBoxLayout()
+        self.script_consent = QCheckBox("I understand this runs trusted code")
+        script_controls.addWidget(self.script_consent)
+        script_controls.addWidget(QLabel("Timeout (seconds):"))
+        self.script_timeout = QSpinBox()
+        self.script_timeout.setRange(1, 600)
+        self.script_timeout.setValue(60)
+        script_controls.addWidget(self.script_timeout)
+        script_controls.addStretch()
+        run_script = QPushButton("Run Script")
+        run_script.setProperty("class", "warning")
+        run_script.clicked.connect(self.run_script)
+        script_controls.addWidget(run_script)
+        script_layout.addLayout(script_controls)
+        self.script_output = QPlainTextEdit()
+        self.script_output.setReadOnly(True)
+        self.script_output.setMaximumHeight(120)
+        script_layout.addWidget(self.script_output)
+        layout.addWidget(script_group)
+
+        template_group = QGroupBox("  Template-Repository Deployment")
+        template_layout = QVBoxLayout(template_group)
+        template_controls = QHBoxLayout()
+        template_controls.addWidget(QLabel("Template folder or Git URL:"))
+        self.template_source = QLineEdit()
+        template_controls.addWidget(self.template_source, 1)
+        browse = QPushButton("Browse")
+        browse.setProperty("class", "secondary")
+        browse.clicked.connect(self.browse_template)
+        template_controls.addWidget(browse)
+        template_layout.addLayout(template_controls)
+        template_actions = QHBoxLayout()
+        template_actions.addWidget(QLabel("Commit message:"))
+        self.template_message = QLineEdit("Apply repository template")
+        template_actions.addWidget(self.template_message, 1)
+        self.template_dry_run = QCheckBox("Dry run")
+        template_actions.addWidget(self.template_dry_run)
+        self.template_push = QCheckBox("Push after commit")
+        template_actions.addWidget(self.template_push)
+        deploy = QPushButton("Apply to Selected")
+        deploy.setProperty("class", "success")
+        deploy.clicked.connect(self.deploy_template)
+        template_actions.addWidget(deploy)
+        template_layout.addLayout(template_actions)
+        self.template_output = QPlainTextEdit()
+        self.template_output.setReadOnly(True)
+        self.template_output.setMaximumHeight(100)
+        template_layout.addWidget(self.template_output)
+        layout.addWidget(template_group)
+
+        offline_group = QGroupBox("  Offline Queue")
+        offline_layout = QHBoxLayout(offline_group)
+        self.offline_status = QLabel()
+        offline_layout.addWidget(self.offline_status)
+        offline_layout.addStretch()
+        refresh_queue = QPushButton("Refresh Queue Status")
+        refresh_queue.setProperty("class", "secondary")
+        refresh_queue.clicked.connect(self.update_offline_status)
+        offline_layout.addWidget(refresh_queue)
+        layout.addWidget(offline_group)
+        self.update_offline_status()
+
+    def log(self, message):
+        self.log_signal.emit(message)
+
+    def refresh_repos(self):
+        self.repo_paths = discover_local_repos(self.app.repos_dir)
+        self.repo_table.setRowCount(len(self.repo_paths))
+        for row, path in enumerate(self.repo_paths):
+            add_checkbox_to_table(self.repo_table, row, 0, True)
+            self.repo_table.setItem(row, 1, QTableWidgetItem(os.path.basename(path)))
+            self.repo_table.setItem(row, 2, QTableWidgetItem(path))
+        self.repo_count_label.setText(f"{len(self.repo_paths)} repositories")
+
+    def _toggle_repos(self, checked):
+        for row in range(self.repo_table.rowCount()):
+            checkbox = get_table_checkbox(self.repo_table, row, 0)
+            if checkbox:
+                checkbox.setChecked(checked)
+
+    def _selected_repos(self):
+        selected = []
+        for row, path in enumerate(self.repo_paths):
+            checkbox = get_table_checkbox(self.repo_table, row, 0)
+            if checkbox and checkbox.isChecked():
+                selected.append(path)
+        return selected
+
+    def run_script(self):
+        if not self.script_consent.isChecked():
+            self.log("Script runner requires explicit trusted-code acknowledgement.")
+            return
+        repos = self._selected_repos()
+        if not repos or not self.app.git_exe:
+            self.log("Select at least one repository and configure Git first.")
+            return
+        script = self.script_editor.toPlainText()
+        self.script_output.setPlainText("Running...\n")
+
+        def run(progress_cb, log_cb):
+            return run_script_runner(script, repos, self.app.git_exe, self.script_timeout.value())
+
+        self.worker = GenericWorker(run)
+        self.worker.finished.connect(self._on_script_done)
+        self.worker.error.connect(lambda error: self.log(f"Script error: {error}"))
+        self.worker.start()
+
+    def _on_script_done(self, result):
+        output = result["stdout"]
+        if result["stderr"]:
+            output += ("\n" if output else "") + result["stderr"]
+        self.script_output.setPlainText(output or "(no output)")
+        self.log(f"Script exited with code {result['returncode']}")
+
+    def browse_template(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Template Folder")
+        if folder:
+            self.template_source.setText(folder)
+
+    def deploy_template(self):
+        source = self.template_source.text().strip()
+        repos = self._selected_repos()
+        if not source or not repos or not self.app.git_exe:
+            self.log("Template deployment requires a source, selected repositories, and Git.")
+            return
+        self.template_output.setPlainText("Deploying...\n")
+
+        def run(progress_cb, log_cb):
+            return deploy_template(
+                source, repos, self.app.git_exe,
+                commit_message=self.template_message.text().strip(),
+                push=self.template_push.isChecked(), dry_run=self.template_dry_run.isChecked(),
+            )
+
+        self.worker = GenericWorker(run)
+        self.worker.finished.connect(lambda report: self.template_output.setPlainText(json.dumps(report, indent=2)))
+        self.worker.error.connect(lambda error: self.log(f"Template error: {error}"))
+        self.worker.start()
+
+    def update_offline_status(self):
+        queue = load_offline_queue()
+        mode = "enabled" if self.app.offline_mode else "disabled"
+        self.offline_status.setText(f"Offline mode: {mode} | queued actions: {len(queue)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN WINDOW
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════════════════
 class AppState:
@@ -4731,13 +5191,29 @@ class AppState:
     @property
     def provider_identity(self):
         """Return the configured user/workspace/namespace identifier."""
-        return self.config.get("provider_namespace") or self.config.get("username", "") or self.config.get("token", "")
+        return self.config.get("provider_namespace") or self.config.get("username", "") or ("authenticated" if self.config.get("token") else "")
+
+    @property
+    def offline_mode(self):
+        return bool(self.config.get("offline_mode", False))
 
     def refresh_provider(self):
         self._provider = create_provider(self.config)
 
     def get_provider(self):
         return self._provider
+
+    def save_repo_cache(self, repos):
+        return save_repo_cache(self.provider_id, self.provider_identity, repos)
+
+    def load_repo_cache(self):
+        return load_repo_cache(self.provider_id, self.provider_identity)
+
+    def queue_offline_action(self, method, endpoint, body=None):
+        return queue_offline_action(self.provider_id, self.provider_identity, method, endpoint, body)
+
+    def replay_offline_queue(self):
+        return replay_offline_queue(self.get_provider(), self.provider_identity)
 
     @property
     def username(self):
@@ -4815,6 +5291,10 @@ class MainWindow(QMainWindow):
         self.local_ops_tab = LocalOpsTab(self.state)
         self.local_ops_tab.log_signal.connect(self.log)
         self.tabs.addTab(self.local_ops_tab, "Local Ops")
+
+        self.automation_tab = AutomationTab(self.state)
+        self.automation_tab.log_signal.connect(self.log)
+        self.tabs.addTab(self.automation_tab, "Automation")
 
         self.backup_tab = BackupTab(self.state)
         self.backup_tab.log_signal.connect(self.log)
@@ -4950,6 +5430,9 @@ class MainWindow(QMainWindow):
         self.theme_combo.addItems(list(THEME_PALETTES.keys()))
         self.theme_combo.currentTextChanged.connect(self._theme_changed)
         al.addWidget(self.theme_combo)
+        self.offline_check = QCheckBox("Offline mode (cache reads / queue writes)")
+        self.offline_check.stateChanged.connect(self._offline_changed)
+        al.addWidget(self.offline_check)
         al.addWidget(QLabel("Right-click any table header to show or hide columns; visibility is saved per profile."))
         al.addStretch()
         layout.addWidget(appearance)
@@ -4987,6 +5470,7 @@ class MainWindow(QMainWindow):
         restore_widgets = [
             self.provider_combo, self.provider_base_input, self.provider_namespace_input,
             self.username_input, self.token_input, self.repos_dir_input, self.theme_combo,
+            self.offline_check,
         ]
         for widget in restore_widgets:
             widget.blockSignals(True)
@@ -5003,6 +5487,7 @@ class MainWindow(QMainWindow):
         if self.theme_combo.findText(theme) < 0:
             theme = "Catppuccin Mocha"
         self.theme_combo.setCurrentText(theme)
+        self.offline_check.setChecked(bool(cfg.get("offline_mode", False)))
         for widget in restore_widgets:
             widget.blockSignals(False)
         self.state.refresh_provider()
@@ -5073,6 +5558,11 @@ class MainWindow(QMainWindow):
         self.state.config["theme"] = theme
         save_config(self.state.config)
         self._apply_theme(theme)
+
+    def _offline_changed(self, state):
+        self.state.config["offline_mode"] = bool(state)
+        save_config(self.state.config)
+        self.log("Offline mode " + ("enabled" if state else "disabled"))
 
     def _init_palette(self):
         self.palette_commands = {
@@ -5170,6 +5660,7 @@ class MainWindow(QMainWindow):
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
+    freeze_support()
     app = QApplication(sys.argv)
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)
