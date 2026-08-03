@@ -14,7 +14,7 @@ All notable changes to GitForge will be documented in this file.
 - Added the PyInstaller multiprocessing freeze guard for reliable frozen Windows startup; release signing and non-Windows publication remain explicitly blocked.
 - Added GraphQL metadata and pull-request APIs, account/org activity snapshots, optional restic and Task Scheduler adapters, bounded parallel Git status with pygit2 fallback, and content-addressed diff caching.
 
-## [v2.1.0] - %Y->- (HEAD -> main, origin/main, origin/HEAD)
+## [v2.1.0] - 2026-04-13
 
 - Added: Add screenshot to README
 - Added: Add files via upload
