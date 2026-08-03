@@ -161,6 +161,30 @@ def test_github_namespace_fetch_merges_personal_and_org_repositories():
     assert session.calls[1][1].endswith("/orgs/team/repos")
 
 
+def test_graphql_metadata_and_research_helpers_are_offline_safe(tmp_path):
+    session = FakeSession([FakeResponse({
+        "data": {"user": {"repositories": {"nodes": [{
+            "name": "one", "nameWithOwner": "alice/one", "isPrivate": False, "isFork": False,
+            "isArchived": False, "url": "https://example/one", "sshUrl": "git@example:one",
+            "diskUsage": 10, "primaryLanguage": {"name": "Python"},
+            "defaultBranchRef": {"name": "main"}, "stargazerCount": 2, "forkCount": 1,
+            "issues": {"totalCount": 3}, "updatedAt": "2026-01-01", "pushedAt": "2026-01-01",
+        }]}}}
+    })])
+    api = gitforge.GitHubAPI("alice", "token", session=session)
+    repos = api.fetch_repo_metadata_graphql("alice")
+    assert repos[0]["language"] == "Python"
+    assert session.calls[0][2]["json"]["variables"] == {"login": "alice"}
+
+    cache_dir = tmp_path / "diff-cache"
+    gitforge.save_content_addressed("repo|HEAD", "diff text", str(cache_dir))
+    assert gitforge.load_content_addressed("repo|HEAD", str(cache_dir)) == "diff text"
+    mapped = gitforge.parallel_repo_map(["b", "a"], lambda value: value.upper(), max_workers=2)
+    assert [item["value"] for item in mapped] == ["A", "B"]
+    assert gitforge.restic_backup("restic", tmp_path, "repo", dry_run=True)["stdout"] == "DRY RUN"
+    assert gitforge.schedule_windows_backup("GitForge-Test", "python gitforge.py", dry_run=True)["returncode"] == 0
+
+
 def _init_repo(path, git):
     subprocess.run([git, "init", "-b", "main", str(path)], check=True, capture_output=True)
     gitforge.run_git(git, path, ["config", "user.name", "Test User"])
@@ -191,6 +215,9 @@ def test_local_operations_cover_worktrees_lfs_and_rebase_todos(tmp_path):
     info = gitforge.lfs_info(git, repo)
     assert info["enabled"] is True
     assert gitforge.discover_local_repos(str(tmp_path)) == sorted([str(repo), str(worktree)])
+    status = gitforge.scan_local_repo_status(git, repo, fetch=False)
+    assert status["branch"] == "main"
+    assert status["dirty"] >= 1
 
     commits = gitforge.rebase_commits(git, repo, 2)
     todo = gitforge.build_rebase_todo(commits)

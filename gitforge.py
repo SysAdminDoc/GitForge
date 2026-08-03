@@ -4,7 +4,7 @@ GitForge - Complete GitHub Repository Manager
 Clone, sync, backup, search, and manage all your GitHub repos from one tool.
 """
 
-import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch, csv, io, tempfile
+import sys, os, subprocess, json, shutil, zipfile, glob, fnmatch, csv, io, tempfile, hashlib
 from multiprocessing import freeze_support
 from pathlib import Path
 
@@ -313,6 +313,166 @@ def deploy_template(template_source, repo_paths, git_exe, files=None, commit_mes
         if temporary_source:
             temporary_source.cleanup()
     return report
+
+
+def cache_content_addressed(content, cache_key, cache_dir=None):
+    """Persist text by SHA-256 so repeated diff views avoid recomputation."""
+    digest = hashlib.sha256(f"{cache_key}\0{content}".encode("utf-8")).hexdigest()
+    cache_dir = cache_dir or os.path.join(get_config_dir(), "diff-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{digest}.txt")
+    if not os.path.isfile(path):
+        with open(path, "w", encoding="utf-8") as cache_file:
+            cache_file.write(content)
+    return path, digest
+
+
+def load_content_addressed(cache_key, cache_dir=None):
+    """Load a content-addressed value when its key index exists."""
+    index_path = os.path.join(cache_dir or os.path.join(get_config_dir(), "diff-cache"), "index.json")
+    try:
+        with open(index_path, encoding="utf-8") as index_file:
+            digest = json.load(index_file).get(cache_key)
+        if not digest:
+            return None
+        with open(os.path.join(os.path.dirname(index_path), f"{digest}.txt"), encoding="utf-8") as cache_file:
+            return cache_file.read()
+    except (OSError, ValueError):
+        return None
+
+
+def save_content_addressed(cache_key, content, cache_dir=None):
+    cache_dir = cache_dir or os.path.join(get_config_dir(), "diff-cache")
+    path, digest = cache_content_addressed(content, cache_key, cache_dir)
+    index_path = os.path.join(cache_dir, "index.json")
+    try:
+        with open(index_path, encoding="utf-8") as index_file:
+            index = json.load(index_file)
+    except (OSError, ValueError):
+        index = {}
+    index[cache_key] = digest
+    temp_path = f"{index_path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as index_file:
+        json.dump(index, index_file, indent=2)
+    os.replace(temp_path, index_path)
+    return path
+
+
+def parallel_repo_map(repo_paths, callback, max_workers=4):
+    """Run independent per-repository work with bounded fan-out."""
+    paths = list(repo_paths)
+    if not paths:
+        return []
+    workers = max(1, min(int(max_workers), len(paths), 16))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(callback, path): path for path in paths}
+        results = []
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                results.append({"repo": path, "ok": True, "value": future.result()})
+            except Exception as error:
+                results.append({"repo": path, "ok": False, "error": str(error)})
+    return sorted(results, key=lambda item: os.fspath(item["repo"]).lower())
+
+
+def fast_repo_status(git_exe, repo_path):
+    """Use pygit2 when installed, otherwise retain the portable Git fallback."""
+    try:
+        import pygit2
+        repository = pygit2.Repository(os.fspath(repo_path))
+        status = repository.status()
+        head = repository.head.shorthand if not repository.head_is_unborn else "(unborn)"
+        return {"branch": head, "dirty": len(status), "backend": "pygit2"}
+    except (AttributeError, ImportError, OSError, ValueError, RuntimeError):
+        output = run_git(git_exe, repo_path, ["status", "--porcelain"])
+        branch = run_git(git_exe, repo_path, ["branch", "--show-current"]) or "(detached)"
+        return {"branch": branch, "dirty": len([line for line in output.splitlines() if line.strip()]), "backend": "git"}
+
+
+def scan_local_repo_status(git_exe, repo_path, fetch=True):
+    """Collect one sync row; designed to run independently in a worker pool."""
+    name = os.path.basename(os.fspath(repo_path))
+    info = {"name": name, "path": os.fspath(repo_path), "branch": "?", "ahead": 0, "behind": 0,
+            "dirty": 0, "status": "Unknown", "last_commit": ""}
+    try:
+        info["branch"] = run_git(git_exe, repo_path, ["rev-parse", "--abbrev-ref", "HEAD"]) or "detached"
+        if fetch:
+            subprocess.run([git_exe, "-C", os.fspath(repo_path), "fetch", "--quiet"], capture_output=True, timeout=30)
+        ahead_behind = subprocess.run(
+            [git_exe, "-C", os.fspath(repo_path), "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+        if ahead_behind.returncode == 0:
+            parts = ahead_behind.stdout.strip().split()
+            if len(parts) == 2:
+                info["ahead"], info["behind"] = int(parts[0]), int(parts[1])
+        dirty = run_git(git_exe, repo_path, ["status", "--porcelain"])
+        info["dirty"] = len([line for line in dirty.splitlines() if line.strip()])
+        info["last_commit"] = run_git(git_exe, repo_path, ["log", "-1", "--format=%ci"])[:19]
+        if info["dirty"] and info["ahead"]:
+            info["status"] = "Dirty + Ahead"
+        elif info["dirty"]:
+            info["status"] = "Dirty"
+        elif info["ahead"] and info["behind"]:
+            info["status"] = "Diverged"
+        elif info["ahead"]:
+            info["status"] = "Ahead"
+        elif info["behind"]:
+            info["status"] = "Behind"
+        else:
+            info["status"] = "Up to date"
+    except Exception as error:
+        info["status"] = "Error"
+        info["error"] = str(error)
+    return info
+
+
+def export_account_snapshot(api, repositories, destination, organization="", include_gists=True, include_starred=True, include_activity=True):
+    """Write a structured GitHub account/org snapshot suitable for offline review."""
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    payloads = {"repositories.json": repositories}
+    if include_gists:
+        payloads["gists.json"] = api.list_gists()
+    if include_starred:
+        payloads["starred.json"] = api.list_starred()
+    if organization:
+        payloads["organization-members.json"] = api.list_org_members(organization)
+        payloads["organization-teams.json"] = api.list_org_teams(organization)
+    if include_activity:
+        for repo in repositories:
+            full_name = repo.get("full_name") or repo.get("name")
+            if not full_name:
+                continue
+            stem = re.sub(r"[^A-Za-z0-9_.-]", "_", full_name)
+            payloads[f"{stem}-issues.json"] = api.list_issues(full_name)
+            payloads[f"{stem}-pull-requests.json"] = api.list_pull_requests(full_name)
+    for filename, payload in payloads.items():
+        (destination / filename).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return sorted(os.fspath(destination / filename) for filename in payloads)
+
+
+def restic_backup(restic_exe, source_dir, repository, password_env="RESTIC_PASSWORD", dry_run=False):
+    """Run restic backup without ever accepting or persisting a plaintext password."""
+    command = [restic_exe, "-r", repository, "backup", os.fspath(source_dir)]
+    if dry_run:
+        return {"command": command, "returncode": 0, "stdout": "DRY RUN", "stderr": ""}
+    if not shutil.which(restic_exe) and not os.path.isfile(restic_exe):
+        raise FileNotFoundError(f"restic executable not found: {restic_exe}")
+    if not os.environ.get(password_env):
+        raise RuntimeError(f"Set {password_env} in the process environment before running restic")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+    return {"command": command, "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+
+def schedule_windows_backup(task_name, command, start_time="02:00", schedule="DAILY", dry_run=False):
+    """Create a Task Scheduler command; dry-run is the default-safe integration path."""
+    task_command = ["schtasks", "/Create", "/TN", task_name, "/TR", command, "/SC", schedule, "/ST", start_time, "/F"]
+    if dry_run:
+        return {"command": task_command, "returncode": 0, "stdout": "DRY RUN", "stderr": ""}
+    result = subprocess.run(task_command, capture_output=True, text=True, timeout=30)
+    return {"command": task_command, "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GIT DETECTION
@@ -737,6 +897,68 @@ class GitHubAPI(RepositoryProvider):
                     "type": collaborator.get("type", "User"),
                 })
         return report
+
+    def list_gists(self, log_cb=None):
+        return self._get_pages("/gists", log_cb=log_cb)
+
+    def list_starred(self, log_cb=None):
+        return self._get_pages("/user/starred", log_cb=log_cb)
+
+    def list_issues(self, full_name, state="all", log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/issues", {"state": state}, log_cb=log_cb)
+
+    def list_pull_requests(self, full_name, state="open", log_cb=None):
+        return self._get_pages(f"/repos/{full_name}/pulls", {"state": state}, log_cb=log_cb)
+
+    def list_org_members(self, organization, log_cb=None):
+        return self._get_pages(f"/orgs/{organization}/members", log_cb=log_cb)
+
+    def list_org_teams(self, organization, log_cb=None):
+        return self._get_pages(f"/orgs/{organization}/teams", log_cb=log_cb)
+
+    def graphql(self, query, variables=None, log_cb=None):
+        payload = {"query": query, "variables": variables or {}}
+        response = self.post("/graphql", payload, log_cb=log_cb)
+        data = self._require_success(response)
+        if data.get("errors"):
+            raise Exception(f"GitHub GraphQL error: {data['errors'][0].get('message', 'unknown error')}")
+        return data.get("data", {})
+
+    def fetch_repo_metadata_graphql(self, owner, organization=False, log_cb=None):
+        """Fetch a compact bulk metadata page with one GraphQL request."""
+        root = "organization" if organization else "user"
+        query = f"""
+        query($login: String!) {{
+          {root}(login: $login) {{
+            repositories(first: 100, ownerAffiliations: [OWNER, COLLABORATOR], orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+              nodes {{ name nameWithOwner description isPrivate isFork isArchived url sshUrl
+                diskUsage primaryLanguage {{ name }} stargazerCount forkCount issues {{ totalCount }}
+                defaultBranchRef {{ name }} pushedAt updatedAt }}
+            }}
+          }}
+        }}
+        """
+        data = self.graphql(query, {"login": owner}, log_cb=log_cb)
+        container = data.get(root) or {}
+        normalized = []
+        for repo in container.get("repositories", {}).get("nodes", []) or []:
+            language = repo.get("primaryLanguage") or {}
+            normalized.append({
+                "name": repo.get("name", ""), "full_name": repo.get("nameWithOwner", ""),
+                "description": repo.get("description") or "", "private": bool(repo.get("isPrivate")),
+                "fork": bool(repo.get("isFork")), "archived": bool(repo.get("isArchived")),
+                "clone_url": repo.get("url", ""), "ssh_url": repo.get("sshUrl", ""),
+                "html_url": repo.get("url", ""), "size": repo.get("diskUsage") or 0,
+                "language": language.get("name", ""), "updated_at": repo.get("updatedAt", ""),
+                "pushed_at": repo.get("pushedAt", ""),
+                "default_branch": (repo.get("defaultBranchRef") or {}).get("name") or "main",
+                "stargazers_count": repo.get("stargazerCount", 0),
+                "forks_count": repo.get("forkCount", 0),
+                "open_issues_count": (repo.get("issues") or {}).get("totalCount", 0),
+                "topics": [], "has_wiki": False, "has_issues": True,
+                "provider": "github", "source": "graphql",
+            })
+        return normalized
 
 
 class GitLabAPI(RepositoryProvider):
@@ -2108,67 +2330,25 @@ class SyncTab(QWidget):
         git = self.app.git_exe
 
         def do_scan(progress_cb, log_cb):
-            repos = []
             entries = sorted([d for d in os.listdir(dest)
                              if os.path.isdir(os.path.join(dest, d, ".git"))])
             total = len(entries)
             log_cb(f"Found {total} local repos, analyzing...")
-
-            for i, name in enumerate(entries):
-                progress_cb(i, total)
-                rpath = os.path.join(dest, name)
-                info = {"name": name, "path": rpath, "branch": "?", "ahead": 0, "behind": 0,
-                        "dirty": 0, "status": "Unknown", "last_commit": ""}
-                try:
-                    # Current branch
-                    r = subprocess.run([git, "-C", rpath, "rev-parse", "--abbrev-ref", "HEAD"],
-                                       capture_output=True, text=True, timeout=10)
-                    info["branch"] = r.stdout.strip() if r.returncode == 0 else "detached"
-
-                    # Fetch remote info silently
-                    subprocess.run([git, "-C", rpath, "fetch", "--quiet"],
-                                   capture_output=True, timeout=30)
-
-                    # Ahead/behind
-                    r = subprocess.run([git, "-C", rpath, "rev-list", "--left-right", "--count",
-                                        f"HEAD...@{{upstream}}"],
-                                       capture_output=True, text=True, timeout=10)
-                    if r.returncode == 0:
-                        parts = r.stdout.strip().split()
-                        if len(parts) == 2:
-                            info["ahead"] = int(parts[0])
-                            info["behind"] = int(parts[1])
-
-                    # Dirty (uncommitted changes)
-                    r = subprocess.run([git, "-C", rpath, "status", "--porcelain"],
-                                       capture_output=True, text=True, timeout=10)
-                    info["dirty"] = len([l for l in r.stdout.strip().split("\n") if l.strip()]) if r.returncode == 0 else 0
-
-                    # Last commit date
-                    r = subprocess.run([git, "-C", rpath, "log", "-1", "--format=%ci"],
-                                       capture_output=True, text=True, timeout=10)
-                    if r.returncode == 0 and r.stdout.strip():
-                        info["last_commit"] = r.stdout.strip()[:19]
-
-                    # Determine status
-                    if info["dirty"] > 0 and info["ahead"] > 0:
-                        info["status"] = "Dirty + Ahead"
-                    elif info["dirty"] > 0:
-                        info["status"] = "Dirty"
-                    elif info["ahead"] > 0 and info["behind"] > 0:
-                        info["status"] = "Diverged"
-                    elif info["ahead"] > 0:
-                        info["status"] = "Ahead"
-                    elif info["behind"] > 0:
-                        info["status"] = "Behind"
-                    else:
-                        info["status"] = "Up to date"
-
-                except Exception as e:
-                    info["status"] = f"Error"
-                    log_cb(f"  {name}: {e}")
-
-                repos.append(info)
+            results = parallel_repo_map(
+                [os.path.join(dest, name) for name in entries],
+                lambda path: scan_local_repo_status(git, path, fetch=True),
+                max_workers=4,
+            )
+            repos = []
+            for index, result in enumerate(results):
+                progress_cb(index, total)
+                if result["ok"]:
+                    info = result["value"]
+                    if info.get("error"):
+                        log_cb(f"  {info['name']}: {info['error']}")
+                    repos.append(info)
+                else:
+                    log_cb(f"  {result['repo']}: {result['error']}")
             progress_cb(total, total)
             return repos
 
@@ -2366,6 +2546,30 @@ class BackupTab(QWidget):
         cg.addLayout(row)
         layout.addWidget(clean_group)
 
+        offsite_group = QGroupBox("  Off-site Deduplicated Backup (restic)")
+        offsite_layout = QVBoxLayout(offsite_group)
+        offsite_controls = QHBoxLayout()
+        offsite_controls.addWidget(QLabel("restic:"))
+        self.restic_exe_input = QLineEdit("restic")
+        self.restic_exe_input.setFixedWidth(120)
+        offsite_controls.addWidget(self.restic_exe_input)
+        offsite_controls.addWidget(QLabel("Repository:"))
+        self.restic_repo_input = QLineEdit()
+        self.restic_repo_input.setPlaceholderText("restic repository path or URL")
+        offsite_controls.addWidget(self.restic_repo_input, 1)
+        self.restic_dry_run = QCheckBox("Dry run")
+        self.restic_dry_run.setChecked(True)
+        offsite_controls.addWidget(self.restic_dry_run)
+        restic_btn = QPushButton("Backup Local Repos")
+        restic_btn.setProperty("class", "secondary")
+        restic_btn.clicked.connect(self.run_restic_backup)
+        offsite_controls.addWidget(restic_btn)
+        offsite_layout.addLayout(offsite_controls)
+        offsite_note = QLabel("Password is read only from the configured RESTIC_PASSWORD environment variable and is never stored by GitForge.")
+        offsite_note.setProperty("class", "subtitle")
+        offsite_layout.addWidget(offsite_note)
+        layout.addWidget(offsite_group)
+
         self.progress = QProgressBar()
         self.progress.setValue(0)
         self.progress.setMaximum(1)
@@ -2534,6 +2738,21 @@ class BackupTab(QWidget):
         ))
         self.worker.error.connect(lambda e: (self.bulk_gc_btn.setEnabled(True), self.log(f"ERROR: {e}")))
         self.worker.start()
+
+    def run_restic_backup(self):
+        source = self.app.repos_dir
+        repository = self.restic_repo_input.text().strip()
+        if not source or not repository:
+            self.log("Restic backup requires the local repos folder and repository target.")
+            return
+        try:
+            result = restic_backup(
+                self.restic_exe_input.text().strip() or "restic", source, repository,
+                dry_run=self.restic_dry_run.isChecked(),
+            )
+            self.log(result["stdout"] or result["stderr"] or "Restic backup complete.")
+        except Exception as error:
+            self.log(f"Restic error: {error}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4057,13 +4276,27 @@ class DiffTab(QWidget):
             else:
                 cmd = [git, "-C", repo_path, "diff", "--", file_path]
 
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            cache_key = "|".join([repo_path, ftype, file_path, *cmd])
+            cached_diff = load_content_addressed(cache_key)
+            if cached_diff is not None:
+                diff_text = cached_diff
+                return_code = 0
+                self.log(f"Loaded cached diff for {self.current_repo}/{file_path}")
+            else:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                diff_text = r.stdout
+                return_code = r.returncode
+                if return_code == 0 and diff_text.strip():
+                    try:
+                        save_content_addressed(cache_key, diff_text)
+                    except Exception as error:
+                        self.log(f"Diff cache warning: {error}")
 
-            if r.returncode == 0 and r.stdout.strip():
-                self._render_diff(r.stdout)
+            if return_code == 0 and diff_text.strip():
+                self._render_diff(diff_text)
                 # Update line count
-                added = r.stdout.count("\n+") - r.stdout.count("\n+++")
-                removed = r.stdout.count("\n-") - r.stdout.count("\n---")
+                added = diff_text.count("\n+") - diff_text.count("\n+++")
+                removed = diff_text.count("\n-") - diff_text.count("\n---")
                 lines_item = self.file_list.item(row, 2)
                 if lines_item:
                     lines_item.setText(f"+{added}/-{removed}")
@@ -4342,6 +4575,10 @@ class AdvancedAPITab(QWidget):
         workflow_runs.setProperty("class", "secondary")
         workflow_runs.clicked.connect(self.list_workflow_runs)
         workflow_controls.addWidget(workflow_runs)
+        pull_requests = QPushButton("List PRs")
+        pull_requests.setProperty("class", "secondary")
+        pull_requests.clicked.connect(self.list_pull_requests)
+        workflow_controls.addWidget(pull_requests)
         workflow_controls.addStretch()
         workflows_layout.addLayout(workflow_controls)
         self.workflow_table = make_table([
@@ -4389,6 +4626,10 @@ class AdvancedAPITab(QWidget):
         audit_collaborators.setProperty("class", "secondary")
         audit_collaborators.clicked.connect(self.audit_collaborators)
         audit_controls.addWidget(audit_collaborators)
+        export_snapshot = QPushButton("Export Account Snapshot")
+        export_snapshot.setProperty("class", "secondary")
+        export_snapshot.clicked.connect(self.export_account_snapshot)
+        audit_controls.addWidget(export_snapshot)
         audit_controls.addStretch()
         actions_layout.addLayout(audit_controls)
         self.api_output = QPlainTextEdit()
@@ -4580,6 +4821,20 @@ class AdvancedAPITab(QWidget):
         except Exception as error:
             self.log(f"Workflow error: {error}")
 
+    def list_pull_requests(self):
+        api = self._api()
+        repo = self._repo()
+        if not api or not repo:
+            return
+        try:
+            pulls = api.list_pull_requests(repo, log_cb=self.log)
+            self.api_output.setPlainText(json.dumps([
+                {"number": pull.get("number"), "title": pull.get("title"), "state": pull.get("state"), "user": (pull.get("user") or {}).get("login"), "updated_at": pull.get("updated_at")} for pull in pulls
+            ], indent=2))
+            self.log(f"Loaded {len(pulls)} open pull requests for {repo}")
+        except Exception as error:
+            self.log(f"Pull request error: {error}")
+
     def list_action_values(self):
         api = self._api()
         repo = self._repo()
@@ -4674,6 +4929,23 @@ class AdvancedAPITab(QWidget):
             self.log(f"Audited {len(report)} collaborator assignments")
         except Exception as error:
             self.log(f"Collaborator error: {error}")
+
+    def export_account_snapshot(self):
+        api = self._api()
+        repos = self.app.repos_cache or []
+        if not api or not repos:
+            return
+        destination = QFileDialog.getExistingDirectory(self, "Select Snapshot Folder")
+        if not destination:
+            return
+        try:
+            files = export_account_snapshot(
+                api, repos, destination, organization=self.app.config.get("provider_namespace", "")
+            )
+            self.api_output.setPlainText("\n".join(files))
+            self.log(f"Account snapshot exported to {destination}")
+        except Exception as error:
+            self.log(f"Snapshot error: {error}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
