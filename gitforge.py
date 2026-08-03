@@ -149,15 +149,125 @@ def find_git():
     return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GITHUB API HELPER
+# PROVIDER API HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
-class GitHubAPI:
+PROVIDER_DEFAULTS = {
+    "github": "https://api.github.com",
+    "gitlab": "https://gitlab.com/api/v4",
+    "gitea": "https://gitea.com/api/v1",
+    "forgejo": "https://codeberg.org/api/v1",
+    "bitbucket": "https://api.bitbucket.org/2.0",
+}
+
+PROVIDER_LABELS = {
+    "github": "GitHub",
+    "gitlab": "GitLab",
+    "gitea": "Gitea",
+    "forgejo": "Forgejo",
+    "bitbucket": "Bitbucket Cloud",
+}
+
+
+class RepositoryProvider:
+    """Small provider contract shared by every forge adapter.
+
+    Adapters return dictionaries with the fields consumed by the existing UI.
+    Additional provider-specific fields are preserved so future tabs can use
+    them without changing the normalized table contract.
+    """
+
+    provider_id = "generic"
+    display_name = "Repository provider"
+    read_only = False
+
+    def __init__(self, identity="", token="", base_url="", namespace="", session=None):
+        self.username = identity.strip()
+        self.token = token.strip()
+        self.namespace = (namespace or self.username).strip()
+        self.base_url = (base_url or PROVIDER_DEFAULTS.get(self.provider_id, "")).rstrip("/")
+        self.session = session or requests.Session()
+        self._rate_remaining = None
+        self._rate_reset = None
+
+    @property
+    def headers(self):
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _url(self, path):
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        return f"{self.base_url}/{path.lstrip('/')}"
+
+    def _update_rate_info(self, response):
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        reset = response.headers.get("X-RateLimit-Reset")
+        try:
+            self._rate_remaining = int(remaining) if remaining is not None else None
+        except (TypeError, ValueError):
+            self._rate_remaining = None
+        try:
+            self._rate_reset = int(reset) if reset is not None else None
+        except (TypeError, ValueError):
+            self._rate_reset = None
+
+    def _wait_if_rate_limited(self, log_cb=None):
+        if self._rate_remaining is None or self._rate_remaining > 5:
+            return
+        wait = max(0, (self._rate_reset or int(time.time())) - int(time.time())) + 1
+        if 0 < wait < 900:
+            if log_cb:
+                log_cb(f"Rate limit near ({self._rate_remaining} left), waiting {wait}s...")
+            time.sleep(wait)
+
+    def request(self, method, path, params=None, data=None, log_cb=None, timeout=30):
+        if self.read_only and method.upper() not in {"GET", "HEAD"}:
+            raise PermissionError(f"{self.display_name} is configured as read-only in GitForge")
+        self._wait_if_rate_limited(log_cb)
+        response = self.session.request(
+            method.upper(), self._url(path), headers=self.headers, params=params,
+            json=data, timeout=timeout)
+        self._update_rate_info(response)
+        return response
+
+    def get(self, path, params=None, log_cb=None):
+        return self.request("GET", path, params=params, log_cb=log_cb)
+
+    def patch(self, path, data, log_cb=None):
+        return self.request("PATCH", path, data=data, log_cb=log_cb)
+
+    def post(self, path, data, log_cb=None):
+        return self.request("POST", path, data=data, log_cb=log_cb)
+
+    def put(self, path, data, log_cb=None):
+        return self.request("PUT", path, data=data, log_cb=log_cb)
+
+    def delete(self, path, log_cb=None):
+        return self.request("DELETE", path, log_cb=log_cb)
+
+    @property
+    def rate_limit_info(self):
+        if self._rate_remaining is None:
+            return "unknown"
+        reset_dt = datetime.fromtimestamp(self._rate_reset).strftime("%H:%M:%S") if self._rate_reset else "?"
+        return f"{self._rate_remaining} remaining (resets {reset_dt})"
+
+    def supports(self, capability):
+        return capability in {"list_repos", "clone", "read_only" if self.read_only else "write"}
+
+    def fetch_all_repos(self, log_cb=None):
+        raise NotImplementedError
+
+
+class GitHubAPI(RepositoryProvider):
     """Centralized GitHub API access with rate-limit awareness."""
     BASE = "https://api.github.com"
 
-    def __init__(self, username="", token=""):
-        self.username = username
-        self.token = token
+    def __init__(self, username="", token="", base_url="", session=None):
+        super().__init__(username, token, base_url or self.BASE, session=session)
+        self.BASE = self.base_url
         self._rate_remaining = None
         self._rate_reset = None
 
@@ -262,6 +372,266 @@ class GitHubAPI:
             if len(data) < 100: break
             page += 1
         return repos
+
+
+class GitLabAPI(RepositoryProvider):
+    """GitLab REST v4 adapter for personal and group-accessible projects."""
+
+    provider_id = "gitlab"
+    display_name = "GitLab"
+
+    @property
+    def headers(self):
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["PRIVATE-TOKEN"] = self.token
+        return headers
+
+    @staticmethod
+    def _normalize(repo):
+        namespace = repo.get("namespace") or {}
+        return {
+            "name": repo.get("path") or repo.get("name", ""),
+            "full_name": repo.get("path_with_namespace") or repo.get("name", ""),
+            "description": repo.get("description") or "",
+            "private": repo.get("visibility", "private") == "private",
+            "fork": bool(repo.get("forked_from_project")),
+            "archived": bool(repo.get("archived", False)),
+            "clone_url": repo.get("http_url_to_repo") or repo.get("web_url", ""),
+            "ssh_url": repo.get("ssh_url_to_repo") or "",
+            "html_url": repo.get("web_url", ""),
+            "size": repo.get("statistics", {}).get("repository_size", repo.get("repository_size", 0)) or 0,
+            "language": repo.get("language") or "",
+            "updated_at": repo.get("last_activity_at") or repo.get("updated_at") or "",
+            "pushed_at": repo.get("last_activity_at") or "",
+            "default_branch": repo.get("default_branch") or "main",
+            "stargazers_count": repo.get("star_count", 0) or 0,
+            "forks_count": repo.get("forks_count", 0) or 0,
+            "open_issues_count": repo.get("open_issues_count", 0) or 0,
+            "topics": repo.get("topics", []) or repo.get("tag_list", []) or [],
+            "has_wiki": bool(repo.get("wiki_enabled", False)),
+            "has_issues": bool(repo.get("issues_enabled", True)),
+            "namespace": namespace.get("full_path") or namespace.get("name") or "",
+            "provider": "gitlab",
+            "provider_id": repo.get("id"),
+        }
+
+    def fetch_all_repos(self, log_cb=None):
+        projects = []
+        page = 1
+        while True:
+            params = {"per_page": 100, "page": page, "order_by": "last_activity_at"}
+            if self.token:
+                params.update({"membership": "true", "owned": "true", "include_subgroups": "true"})
+                path = "/projects"
+            else:
+                if not self.username:
+                    raise ValueError("GitLab username is required when no token is configured")
+                path = f"/users/{self.username}/projects"
+            if log_cb:
+                log_cb(f"Fetching GitLab projects page {page}...")
+            response = self.get(path, params=params, log_cb=log_cb)
+            if response.status_code in (401, 403):
+                raise Exception("GitLab authentication failed or access was denied.")
+            if response.status_code != 200:
+                raise Exception(f"GitLab API error {response.status_code}: {response.text[:200]}")
+            data = response.json()
+            if not data:
+                break
+            projects.extend(self._normalize(project) for project in data)
+            next_page = response.headers.get("X-Next-Page", "")
+            if not next_page:
+                break
+            page = int(next_page)
+        return projects
+
+
+class GiteaAPI(RepositoryProvider):
+    """Gitea-compatible adapter; also covers most Forgejo installations."""
+
+    provider_id = "gitea"
+    display_name = "Gitea"
+
+    @property
+    def headers(self):
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"token {self.token}"
+        return headers
+
+    @staticmethod
+    def _normalize(repo):
+        owner = repo.get("owner") or {}
+        return {
+            "name": repo.get("name", ""),
+            "full_name": repo.get("full_name") or f"{owner.get('login', '')}/{repo.get('name', '')}".strip("/"),
+            "description": repo.get("description") or "",
+            "private": bool(repo.get("private", False)),
+            "fork": bool(repo.get("fork", False)),
+            "archived": bool(repo.get("archived", False)),
+            "clone_url": repo.get("clone_url") or repo.get("html_url", ""),
+            "ssh_url": repo.get("ssh_url") or "",
+            "html_url": repo.get("html_url", ""),
+            "size": repo.get("size", 0) or 0,
+            "language": repo.get("language") or "",
+            "updated_at": repo.get("updated_at") or "",
+            "pushed_at": repo.get("updated_at") or "",
+            "default_branch": repo.get("default_branch") or "main",
+            "stargazers_count": repo.get("stars_count", 0) or 0,
+            "forks_count": repo.get("forks_count", 0) or 0,
+            "open_issues_count": repo.get("open_issues_count", 0) or 0,
+            "topics": repo.get("topics", []) or [],
+            "has_wiki": bool(repo.get("has_wiki", False)),
+            "has_issues": bool(repo.get("has_issues", True)),
+            "namespace": owner.get("login", ""),
+            "provider": "gitea",
+            "provider_id": repo.get("id"),
+        }
+
+    def _fetch_page(self, path, page, log_cb=None):
+        response = self.get(path, params={"page": page, "limit": 50}, log_cb=log_cb)
+        if response.status_code in (401, 403):
+            raise Exception(f"{self.display_name} authentication failed or access was denied.")
+        if response.status_code != 200:
+            raise Exception(f"{self.display_name} API error {response.status_code}: {response.text[:200]}")
+        return response.json()
+
+    def fetch_all_repos(self, log_cb=None):
+        if self.token:
+            path = "/user/repos"
+        elif self.username:
+            path = f"/users/{self.username}/repos"
+        else:
+            raise ValueError(f"{self.display_name} username is required when no token is configured")
+        repos = []
+        page = 1
+        while True:
+            if log_cb:
+                log_cb(f"Fetching {self.display_name} repositories page {page}...")
+            data = self._fetch_page(path, page, log_cb)
+            if not data:
+                break
+            repos.extend(self._normalize(repo) for repo in data)
+            if len(data) < 50:
+                break
+            page += 1
+        if self.namespace and self.namespace != self.username and self.token:
+            org_path = f"/orgs/{self.namespace}/repos"
+            page = 1
+            while True:
+                data = self._fetch_page(org_path, page, log_cb)
+                if not data:
+                    break
+                repos.extend(self._normalize(repo) for repo in data)
+                if len(data) < 50:
+                    break
+                page += 1
+        unique = {repo["full_name"]: repo for repo in repos}
+        return list(unique.values())
+
+
+class ForgejoAPI(GiteaAPI):
+    """Forgejo adapter using the Gitea-compatible API surface."""
+
+    provider_id = "forgejo"
+    display_name = "Forgejo"
+
+    @staticmethod
+    def _normalize(repo):
+        normalized = GiteaAPI._normalize(repo)
+        normalized["provider"] = "forgejo"
+        return normalized
+
+
+class BitbucketAPI(RepositoryProvider):
+    """Read-only Bitbucket Cloud adapter for migration and inventory work."""
+
+    provider_id = "bitbucket"
+    display_name = "Bitbucket Cloud"
+    read_only = True
+
+    @property
+    def headers(self):
+        headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    @staticmethod
+    def _normalize(repo):
+        links = repo.get("links") or {}
+        clone_links = links.get("clone") or []
+        clone_url = next((item.get("href") for item in clone_links if item.get("name") == "https"), "")
+        ssh_url = next((item.get("href") for item in clone_links if item.get("name") == "ssh"), "")
+        owner = repo.get("owner") or {}
+        project = repo.get("project") or {}
+        return {
+            "name": repo.get("name", ""),
+            "full_name": f"{(repo.get('workspace') or {}).get('slug') or owner.get('nickname', '')}/{repo.get('slug') or repo.get('name', '')}".strip("/"),
+            "description": repo.get("description") or "",
+            "private": bool(repo.get("is_private", False)),
+            "fork": False,
+            "archived": False,
+            "clone_url": clone_url,
+            "ssh_url": ssh_url,
+            "html_url": (links.get("html") or {}).get("href", ""),
+            "size": 0,
+            "language": repo.get("language") or "",
+            "updated_at": repo.get("updated_on") or "",
+            "pushed_at": repo.get("updated_on") or "",
+            "default_branch": (repo.get("mainbranch") or {}).get("name") or "main",
+            "stargazers_count": 0,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "topics": [],
+            "has_wiki": False,
+            "has_issues": False,
+            "namespace": project.get("key") or owner.get("nickname", ""),
+            "provider": "bitbucket",
+            "provider_id": repo.get("uuid"),
+        }
+
+    def fetch_all_repos(self, log_cb=None):
+        workspace = self.namespace or self.username
+        if not workspace:
+            raise ValueError("Bitbucket workspace is required")
+        repos = []
+        path = f"/repositories/{workspace}"
+        while path:
+            if log_cb:
+                log_cb(f"Fetching Bitbucket repositories...")
+            response = self.get(path, params={"pagelen": 100} if not path.startswith("http") else None, log_cb=log_cb)
+            if response.status_code in (401, 403):
+                raise Exception("Bitbucket authentication failed or workspace access was denied.")
+            if response.status_code != 200:
+                raise Exception(f"Bitbucket API error {response.status_code}: {response.text[:200]}")
+            payload = response.json()
+            repos.extend(self._normalize(repo) for repo in payload.get("values", []))
+            path = payload.get("next")
+        return repos
+
+
+def create_provider(config):
+    """Build the configured adapter while preserving GitHub's legacy defaults."""
+    provider_id = (config.get("provider") or "github").lower()
+    kwargs = {
+        "identity": config.get("username", ""),
+        "token": config.get("token", ""),
+        "base_url": config.get("provider_base_url", ""),
+        "namespace": config.get("provider_namespace", ""),
+    }
+    if provider_id == "gitlab":
+        return GitLabAPI(**kwargs)
+    if provider_id == "gitea":
+        return GiteaAPI(**kwargs)
+    if provider_id == "forgejo":
+        return ForgejoAPI(**kwargs)
+    if provider_id == "bitbucket":
+        return BitbucketAPI(**kwargs)
+    return GitHubAPI(
+        username=kwargs["identity"], token=kwargs["token"],
+        base_url=kwargs["base_url"],
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -540,7 +910,7 @@ class CloneTab(QWidget):
 
         # Fetch controls
         row = QHBoxLayout()
-        self.fetch_btn = QPushButton("Fetch Repos from GitHub")
+        self.fetch_btn = QPushButton(f"Fetch Repos from {self.app.provider_display_name}")
         self.fetch_btn.clicked.connect(self.fetch_repos)
         row.addWidget(self.fetch_btn)
         row.addSpacing(10)
@@ -606,8 +976,8 @@ class CloneTab(QWidget):
         self.log_signal.emit(msg)
 
     def fetch_repos(self):
-        if not self.app.username:
-            QMessageBox.warning(self, "Setup Required", "Set your GitHub username in the Settings tab.")
+        if not self.app.provider_identity:
+            QMessageBox.warning(self, "Setup Required", f"Set your {self.app.provider_display_name} identity in the Settings tab.")
             return
         self.fetch_btn.setEnabled(False)
         self.fetch_btn.setText("Fetching...")
@@ -615,8 +985,8 @@ class CloneTab(QWidget):
         self.table.setRowCount(0)
 
         def do_fetch(progress_cb, log_cb):
-            api = GitHubAPI(self.app.username, self.app.token)
-            return api.fetch_all_repos(log_cb)
+            provider = self.app.get_provider()
+            return provider.fetch_all_repos(log_cb)
 
         self.worker = GenericWorker(do_fetch)
         self.worker.log.connect(self.log)
@@ -631,7 +1001,7 @@ class CloneTab(QWidget):
         self.app.repos_cache = self.repos
         self.populate_table()
         self.fetch_btn.setEnabled(True)
-        self.fetch_btn.setText("Fetch Repos from GitHub")
+        self.fetch_btn.setText(f"Fetch Repos from {self.app.provider_display_name}")
         self.clone_btn.setEnabled(len(self.repos) > 0)
         self.count_label.setText(f"{len(self.repos)} repositories")
         self.log(f"Found {len(self.repos)} repositories")
@@ -639,7 +1009,7 @@ class CloneTab(QWidget):
     def _on_fetch_err(self, err):
         self.log(f"ERROR: {err}")
         self.fetch_btn.setEnabled(True)
-        self.fetch_btn.setText("Fetch Repos from GitHub")
+        self.fetch_btn.setText(f"Fetch Repos from {self.app.provider_display_name}")
         QMessageBox.critical(self, "Fetch Error", err)
 
     def populate_table(self):
@@ -1140,8 +1510,8 @@ class BackupTab(QWidget):
         if not dest:
             QMessageBox.warning(self, "No Destination", "Select a mirror destination.")
             return
-        if not self.app.username:
-            QMessageBox.warning(self, "Setup", "Set username in Settings.")
+        if not self.app.provider_identity:
+            QMessageBox.warning(self, "Setup", f"Set your {self.app.provider_display_name} identity in Settings.")
             return
         git = self.app.git_exe
         if not git: return
@@ -1150,7 +1520,7 @@ class BackupTab(QWidget):
         self._cancelled = False
 
         def do_mirror(progress_cb, log_cb):
-            api = GitHubAPI(self.app.username, self.app.token)
+            api = self.app.get_provider()
             repos = api.fetch_all_repos(log_cb)
             stats = {"ok": 0, "err": 0}
             total = len(repos)
@@ -2887,6 +3257,26 @@ class AppState:
         self.config = load_config()
         self.git_exe = find_git()
         self.repos_cache = []
+        self._provider = create_provider(self.config)
+
+    @property
+    def provider_id(self):
+        return (self.config.get("provider") or "github").lower()
+
+    @property
+    def provider_display_name(self):
+        return PROVIDER_LABELS.get(self.provider_id, "Repository provider")
+
+    @property
+    def provider_identity(self):
+        """Return the configured user/workspace/namespace identifier."""
+        return self.config.get("provider_namespace") or self.config.get("username", "") or self.config.get("token", "")
+
+    def refresh_provider(self):
+        self._provider = create_provider(self.config)
+
+    def get_provider(self):
+        return self._provider
 
     @property
     def username(self):
@@ -2905,7 +3295,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.state = AppState()
-        self.setWindowTitle(f"GitForge - GitHub Repository Manager")
+        self.setWindowTitle(f"GitForge - {self.state.provider_display_name} Repository Manager")
         self.setMinimumSize(1050, 750)
         self.resize(1150, 820)
         self.init_ui()
@@ -3014,19 +3404,45 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(w)
         layout.setSpacing(12)
 
+        # Provider selection
+        provider_group = QGroupBox("  Repository Provider")
+        pl = QVBoxLayout(provider_group)
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        for provider_id, label in PROVIDER_LABELS.items():
+            self.provider_combo.addItem(label, provider_id)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        provider_row.addWidget(self.provider_combo)
+        provider_row.addSpacing(16)
+        provider_row.addWidget(QLabel("API Base URL:"))
+        self.provider_base_input = QLineEdit()
+        self.provider_base_input.setPlaceholderText("Leave blank for the provider default")
+        self.provider_base_input.textChanged.connect(self._save_settings)
+        provider_row.addWidget(self.provider_base_input, 1)
+        pl.addLayout(provider_row)
+        namespace_row = QHBoxLayout()
+        namespace_row.addWidget(QLabel("Workspace / Group (optional):"))
+        self.provider_namespace_input = QLineEdit()
+        self.provider_namespace_input.setPlaceholderText("GitLab group, Gitea org, or Bitbucket workspace")
+        self.provider_namespace_input.textChanged.connect(self._save_settings)
+        namespace_row.addWidget(self.provider_namespace_input, 1)
+        pl.addLayout(namespace_row)
+        layout.addWidget(provider_group)
+
         # Connection
-        conn = QGroupBox("  GitHub Connection")
+        conn = QGroupBox(f"  {self.state.provider_display_name} Connection")
         cl = QVBoxLayout(conn)
         row = QHBoxLayout()
-        row.addWidget(QLabel("Username:"))
+        row.addWidget(QLabel("Username / Account:"))
         self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("e.g. SysAdminDoc")
+        self.username_input.setPlaceholderText("User, account, or workspace")
         self.username_input.textChanged.connect(self._save_settings)
         row.addWidget(self.username_input, 1)
         row.addSpacing(16)
         row.addWidget(QLabel("Personal Access Token:"))
         self.token_input = QLineEdit()
-        self.token_input.setPlaceholderText("ghp_... (needed for private repos & API management)")
+        self.token_input.setPlaceholderText("Provider token (optional for public repositories)")
         self.token_input.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_input.textChanged.connect(self._save_settings)
         row.addWidget(self.token_input, 1)
@@ -3075,6 +3491,14 @@ class MainWindow(QMainWindow):
 
     def _restore_settings(self):
         cfg = self.state.config
+        provider_id = (cfg.get("provider") or "github").lower()
+        provider_index = self.provider_combo.findData(provider_id)
+        if provider_index >= 0:
+            self.provider_combo.blockSignals(True)
+            self.provider_combo.setCurrentIndex(provider_index)
+            self.provider_combo.blockSignals(False)
+        self.provider_base_input.setText(cfg.get("provider_base_url", ""))
+        self.provider_namespace_input.setText(cfg.get("provider_namespace", ""))
         self.username_input.setText(cfg.get("username", ""))
         self.token_input.setText(cfg.get("token", ""))
         self.repos_dir_input.setText(cfg.get("repos_dir", ""))
@@ -3107,10 +3531,27 @@ class MainWindow(QMainWindow):
             self.git_info_label.setStyleSheet("color: #f38ba8;")
 
     def _save_settings(self):
+        self.state.config["provider"] = self.provider_combo.currentData() or "github"
+        self.state.config["provider_base_url"] = self.provider_base_input.text().strip()
+        self.state.config["provider_namespace"] = self.provider_namespace_input.text().strip()
         self.state.config["username"] = self.username_input.text().strip()
         self.state.config["token"] = self.token_input.text().strip()
         self.state.config["repos_dir"] = self.repos_dir_input.text().strip()
         save_config(self.state.config)
+        self.state.refresh_provider()
+
+    def _provider_changed(self):
+        provider_id = self.provider_combo.currentData() or "github"
+        current_base = self.provider_base_input.text().strip()
+        known_defaults = set(PROVIDER_DEFAULTS.values())
+        if not current_base or current_base in known_defaults:
+            self.provider_base_input.setText(PROVIDER_DEFAULTS[provider_id])
+        self.state.config["provider"] = provider_id
+        save_config(self.state.config)
+        self.state.refresh_provider()
+        self.setWindowTitle(f"GitForge - {self.state.provider_display_name} Repository Manager")
+        if hasattr(self, "clone_tab"):
+            self.clone_tab.fetch_btn.setText(f"Fetch Repos from {self.state.provider_display_name}")
 
     def _browse_repos_dir(self):
         f = QFileDialog.getExistingDirectory(self, "Select Repos Folder")
