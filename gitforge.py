@@ -1010,6 +1010,167 @@ def cherry_pick_across_repos(git_exe, source_repo, target_repo, commit):
     return apply_result.stdout.decode(errors="replace").strip()
 
 
+def _dependency_spec(value):
+    """Split a dependency specification into a display name and version."""
+    if isinstance(value, dict):
+        version = value.get("version") or value.get("path") or value.get("git") or "*"
+    else:
+        version = str(value or "*")
+    name = str(version)
+    return name
+
+
+def _add_dependency(records, name, version, source, kind):
+    name = str(name).strip()
+    if not name or name.startswith(("#", "-", "git+", "http://", "https://")):
+        return
+    name = re.split(r"\[", name, maxsplit=1)[0].strip()
+    records.append({"name": name, "version": str(version or "*").strip(), "source": source, "kind": kind})
+
+
+def parse_dependency_file(path):
+    """Parse one supported dependency manifest without installing anything."""
+    path = Path(path)
+    source = path.name
+    records = []
+    if source == "package.json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return records
+        for kind, key in [("runtime", "dependencies"), ("development", "devDependencies"),
+                          ("peer", "peerDependencies"), ("optional", "optionalDependencies")]:
+            for name, version in (data.get(key) or {}).items():
+                _add_dependency(records, name, version, source, kind)
+        return records
+
+    if source == "requirements.txt":
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.split("#", 1)[0].split(";", 1)[0].strip()
+            if not line or line.startswith(("-r ", "--", "-e ")):
+                continue
+            match = re.match(r"^([A-Za-z0-9_.-]+)(?:\s*(==|!=|~=|>=|<=|>|<)\s*(.+))?$", line)
+            if match:
+                version = f"{match.group(2) or ''}{match.group(3) or '*'}".strip()
+                _add_dependency(records, match.group(1), version, source, "runtime")
+        return records
+
+    if source == "pyproject.toml":
+        try:
+            try:
+                import tomllib
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except ImportError:
+                import tomli
+                data = tomli.loads(path.read_text(encoding="utf-8"))
+            project = data.get("project") or {}
+            for spec in project.get("dependencies") or []:
+                match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^]]+\])?\s*(.*)$", spec.split(";", 1)[0])
+                if match:
+                    _add_dependency(records, match.group(1), match.group(2) or "*", source, "runtime")
+            for group, specs in (project.get("optional-dependencies") or {}).items():
+                for spec in specs:
+                    match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^]]+\])?\s*(.*)$", spec.split(";", 1)[0])
+                    if match:
+                        _add_dependency(records, match.group(1), match.group(2) or "*", source, group)
+            return records
+        except (OSError, ValueError, ModuleNotFoundError):
+            return records
+
+    if source == "Cargo.toml":
+        section = ""
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            section_match = re.match(r"^\[([^]]+)\]$", line)
+            if section_match:
+                section = section_match.group(1)
+                continue
+            if section not in {"dependencies", "dev-dependencies", "build-dependencies"} or not line or line.startswith("#"):
+                continue
+            name, separator, value = line.partition("=")
+            if separator:
+                _add_dependency(records, name.strip(), value.strip().strip('"'), source, section)
+        return records
+
+    if source == "go.mod":
+        in_require_block = False
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if line == "require (":
+                in_require_block = True
+                continue
+            if in_require_block and line == ")":
+                in_require_block = False
+                continue
+            if line.startswith("require "):
+                line = line[8:].strip()
+            elif not in_require_block:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                _add_dependency(records, parts[0], parts[1], source, "runtime")
+        return records
+    return records
+
+
+def inventory_dependencies(repo_paths):
+    """Aggregate all supported manifests while retaining repo and source context."""
+    supported = {"package.json", "requirements.txt", "pyproject.toml", "Cargo.toml", "go.mod"}
+    inventory = []
+    for repo_path in repo_paths:
+        for root, dirs, files in os.walk(repo_path):
+            dirs[:] = [directory for directory in dirs if directory not in {".git", "node_modules", "vendor", "target"}]
+            for filename in sorted(set(files) & supported):
+                for record in parse_dependency_file(Path(root) / filename):
+                    inventory.append({"repo": os.path.basename(os.fspath(repo_path)), **record})
+    return inventory
+
+
+def commit_frequency(git_exe, repo_path):
+    """Return commit counts by author date for one repository."""
+    output = run_git(git_exe, repo_path, ["log", "--all", "--format=%ad", "--date=short"])
+    counts = {}
+    for date in output.splitlines():
+        if date.strip():
+            counts[date.strip()] = counts.get(date.strip(), 0) + 1
+    return counts
+
+
+def collect_commit_heatmap(git_exe, repo_paths):
+    """Return per-repository and aggregate date counts for heatmap rendering."""
+    per_repo = {}
+    aggregate = {}
+    for repo_path in repo_paths:
+        try:
+            counts = commit_frequency(git_exe, repo_path)
+        except (GitCommandError, OSError):
+            counts = {}
+        name = os.path.basename(os.fspath(repo_path))
+        per_repo[name] = counts
+        for date, count in counts.items():
+            aggregate[date] = aggregate.get(date, 0) + count
+    return {"repositories": per_repo, "aggregate": aggregate}
+
+
+def top_contributors(git_exe, repo_paths, limit=20):
+    """Aggregate local author identity and commit counts across repositories."""
+    totals = {}
+    for repo_path in repo_paths:
+        try:
+            output = run_git(git_exe, repo_path, ["shortlog", "-sne", "--all"])
+        except (GitCommandError, OSError):
+            continue
+        for line in output.splitlines():
+            match = re.match(r"^\s*(\d+)\s+(.+?)\s+<([^>]+)>\s*$", line)
+            if not match:
+                continue
+            count, name, email = int(match.group(1)), match.group(2).strip(), match.group(3).strip().lower()
+            entry = totals.setdefault(email, {"name": name, "email": email, "commits": 0, "repositories": 0})
+            entry["commits"] += count
+            entry["repositories"] += 1
+    return sorted(totals.values(), key=lambda item: (-item["commits"], item["email"]))[:max(1, int(limit))]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # WORKER THREADS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2532,6 +2693,19 @@ class InsightsTab(QWidget):
         exp_act_btn.clicked.connect(lambda: export_table_to_csv(self.activity_table, self, "recent_activity.csv"))
         row.addWidget(exp_act_btn)
 
+        dependency_btn = QPushButton("Dependencies")
+        dependency_btn.setProperty("class", "secondary")
+        dependency_btn.clicked.connect(self.show_dependency_inventory)
+        row.addWidget(dependency_btn)
+        heatmap_btn = QPushButton("Commit Heatmap")
+        heatmap_btn.setProperty("class", "secondary")
+        heatmap_btn.clicked.connect(self.show_commit_heatmap)
+        row.addWidget(heatmap_btn)
+        contributor_btn = QPushButton("Contributors")
+        contributor_btn.setProperty("class", "secondary")
+        contributor_btn.clicked.connect(self.show_top_contributors)
+        row.addWidget(contributor_btn)
+
         layout.addLayout(row)
 
         # Stats cards row
@@ -2597,8 +2771,79 @@ class InsightsTab(QWidget):
 
         layout.addWidget(splitter, 1)
 
+        analytics_group = QGroupBox("  Local Analytics")
+        analytics_layout = QVBoxLayout(analytics_group)
+        self.insights_output = QPlainTextEdit()
+        self.insights_output.setReadOnly(True)
+        self.insights_output.setPlaceholderText("Dependency, heatmap, and contributor results appear here.")
+        self.insights_output.setMaximumHeight(170)
+        analytics_layout.addWidget(self.insights_output)
+        layout.addWidget(analytics_group)
+
     def log(self, msg):
         self.log_signal.emit(msg)
+
+    def _local_repos(self):
+        if not self.app.git_exe:
+            self.log("Git not found; local analytics are unavailable.")
+            return []
+        repos = discover_local_repos(self.app.repos_dir)
+        if not repos:
+            self.log("No local repositories found for analytics.")
+        return repos
+
+    def _run_local_analysis(self, title, callback, renderer):
+        repos = self._local_repos()
+        if not repos:
+            return
+        self.insights_output.setPlainText(f"{title}...\n")
+
+        def run(progress_cb, log_cb):
+            return callback(repos)
+
+        self.worker = GenericWorker(run)
+        self.worker.log.connect(self.log)
+        self.worker.finished.connect(renderer)
+        self.worker.error.connect(lambda error: self.log(f"{title} error: {error}"))
+        self.worker.start()
+
+    def show_dependency_inventory(self):
+        def render(records):
+            totals = {}
+            for record in records:
+                key = record["name"].lower()
+                entry = totals.setdefault(key, {"name": record["name"], "repos": set(), "versions": set()})
+                entry["repos"].add(record["repo"])
+                entry["versions"].add(record["version"])
+            lines = [f"Dependency inventory: {len(records)} declarations, {len(totals)} unique packages", ""]
+            for entry in sorted(totals.values(), key=lambda item: (-len(item["repos"]), item["name"].lower()))[:200]:
+                versions = ", ".join(sorted(entry["versions"]))
+                lines.append(f"{entry['name']:<32} {versions:<18} {len(entry['repos'])} repos")
+            self.insights_output.setPlainText("\n".join(lines))
+            self.log(f"Dependency inventory: {len(records)} declarations")
+
+        self._run_local_analysis("Scanning dependency manifests", inventory_dependencies, render)
+
+    def show_commit_heatmap(self):
+        def render(heatmap):
+            aggregate = heatmap["aggregate"]
+            lines = [f"Commit heatmap: {sum(aggregate.values())} commits across {len(heatmap['repositories'])} repos", ""]
+            for date, count in sorted(aggregate.items(), reverse=True)[:120]:
+                lines.append(f"{date}  {'#' * min(count, 60)} {count}")
+            self.insights_output.setPlainText("\n".join(lines))
+            self.log(f"Commit heatmap generated for {len(heatmap['repositories'])} repos")
+
+        self._run_local_analysis("Building commit heatmap", lambda repos: collect_commit_heatmap(self.app.git_exe, repos), render)
+
+    def show_top_contributors(self):
+        def render(contributors):
+            lines = ["Top contributors across local repositories", ""]
+            for index, contributor in enumerate(contributors, 1):
+                lines.append(f"{index:>2}. {contributor['name']} <{contributor['email']}> — {contributor['commits']} commits / {contributor['repositories']} repos")
+            self.insights_output.setPlainText("\n".join(lines))
+            self.log(f"Contributor ranking generated for {len(contributors)} identities")
+
+        self._run_local_analysis("Ranking contributors", lambda repos: top_contributors(self.app.git_exe, repos), render)
 
     def refresh(self):
         if not self.app.repos_cache:

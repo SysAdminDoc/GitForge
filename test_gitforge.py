@@ -201,3 +201,41 @@ def test_cherry_pick_transfers_commit_between_unrelated_repositories(tmp_path):
     assert "transfer me" in gitforge.run_git(git, target, ["log", "-1", "--format=%s"])
     assert (target / "source.txt").read_text(encoding="utf-8") == "from source\n"
 
+
+def test_dependency_inventory_supports_requested_manifest_families(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "package.json").write_text(json.dumps({
+        "dependencies": {"requests": "^1.0"},
+        "devDependencies": {"pytest": "^8.0"},
+    }), encoding="utf-8")
+    (repo / "requirements.txt").write_text("httpx>=0.20\n# ignored\n-r other.txt\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        "[project]\ndependencies = ['click>=8']\n[project.optional-dependencies]\ntest = ['pytest>=8']\n",
+        encoding="utf-8",
+    )
+    (repo / "Cargo.toml").write_text("[dependencies]\nserde = '1'\n", encoding="utf-8")
+    (repo / "go.mod").write_text("module example\n\nrequire github.com/pkg/errors v0.9.1\n", encoding="utf-8")
+
+    records = gitforge.inventory_dependencies([str(repo)])
+    names = {record["name"] for record in records}
+
+    assert {"requests", "pytest", "httpx", "click", "serde", "github.com/pkg/errors"}.issubset(names)
+    assert all(record["repo"] == "repo" for record in records)
+
+
+def test_commit_heatmap_and_top_contributors_aggregate_local_history(tmp_path):
+    git = gitforge.find_git()
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    _init_repo(repo_a, git)
+    _commit_file(repo_a, git, "one.txt", "one\n", "one")
+    _commit_file(repo_a, git, "two.txt", "two\n", "two")
+
+    heatmap = gitforge.collect_commit_heatmap(git, [str(repo_a)])
+    contributors = gitforge.top_contributors(git, [str(repo_a)])
+
+    assert sum(heatmap["aggregate"].values()) == 2
+    assert contributors[0]["email"] == "test@example.invalid"
+    assert contributors[0]["commits"] == 2
+
