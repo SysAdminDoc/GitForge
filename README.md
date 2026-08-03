@@ -1,6 +1,6 @@
 # GitForge
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue)
+![Version](https://img.shields.io/badge/version-3.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
 ![Python](https://img.shields.io/badge/Python-3.8+-3776AB?logo=python&logoColor=white)
@@ -17,6 +17,7 @@
 git clone https://github.com/SysAdminDoc/GitForge.git
 cd GitForge
 python gitforge.py  # Auto-installs dependencies on first run
+python gitforge.py --version
 ```
 
 That's it. GitForge auto-installs `PyQt6` and `requests` on first launch. No virtual environments, no config files, no manual setup.
@@ -57,6 +58,10 @@ That's it. GitForge auto-installs `PyQt6` and `requests` on first launch. No vir
 | **GitHub API** | Archive / Unarchive | Archive or restore repos in bulk |
 | **GitHub API** | Create Repos | Create new repositories directly from the GUI |
 | **GitHub API** | Delete Repos | Delete repos from GitHub with double confirmation safety |
+| **Providers** | GitLab / Gitea / Forgejo / Bitbucket | Use one normalized repository workflow across forges; Bitbucket Cloud is read-only |
+| **Local Ops** | Rebase / Worktrees / Submodules / LFS | Plan interactive rebases, transfer commits, manage worktrees, update submodules, and detect LFS |
+| **Automation** | Scripts / Templates / Offline | Run explicitly trusted scripts, deploy templates, cache reads, and queue API writes |
+| **Advanced API** | Releases / Actions / Protection | Manage releases, workflows, branch protection, secrets/variables, hooks, and collaborator audits |
 
 ## How It Works
 

@@ -83,6 +83,7 @@ sys.excepthook = exception_handler
 # CONFIG PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 APP_NAME = "GitForge"
+APP_VERSION = "3.0.0"
 
 def get_config_dir():
     base = os.environ.get('APPDATA', os.path.expanduser('~'))
@@ -5522,7 +5523,7 @@ class MainWindow(QMainWindow):
         title.setProperty("class", "title")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #89b4fa;")
         header.addWidget(title)
-        ver = QLabel("v2.2")
+        ver = QLabel(f"v{APP_VERSION}")
         ver.setProperty("class", "subtitle")
         ver.setStyleSheet("color: #6c7086; font-size: 11px; padding-top: 8px;")
         header.addWidget(ver)
@@ -5782,7 +5783,7 @@ class MainWindow(QMainWindow):
             try:
                 ver = subprocess.run([self.state.git_exe, "--version"],
                                      capture_output=True, text=True, timeout=5).stdout.strip()
-                self.git_info_label.setText(f"{ver}\nPath: {self.state.git_exe}")
+                self.git_info_label.setText(f"GitForge v{APP_VERSION}\n{ver}\nPath: {self.state.git_exe}")
                 self.git_info_label.setStyleSheet("color: #a6e3a1;")
             except:
                 self.git_info_label.setText("Git found but not responding")
@@ -5933,6 +5934,9 @@ class MainWindow(QMainWindow):
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
     freeze_support()
+    if "--version" in sys.argv:
+        print(f"GitForge {APP_VERSION}")
+        return
     app = QApplication(sys.argv)
     branding_icon = QIcon(str(_branding_icon_path()))
     app.setWindowIcon(branding_icon)

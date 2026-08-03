@@ -2,7 +2,7 @@
 
 All notable changes to GitForge will be documented in this file.
 
-## Unreleased
+## [v3.0.0] - 2026-08-03
 
 - Added a provider-agnostic repository API with GitLab, Gitea, Forgejo, and read-only Bitbucket Cloud adapters.
 - Added provider, API endpoint, and workspace configuration while preserving GitHub defaults.
