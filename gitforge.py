@@ -83,7 +83,7 @@ sys.excepthook = exception_handler
 # CONFIG PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 APP_NAME = "GitForge"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 
 def get_config_dir():
     base = os.environ.get('APPDATA', os.path.expanduser('~'))
@@ -4501,7 +4501,7 @@ class AdvancedAPITab(QWidget):
         releases_layout = QVBoxLayout(releases)
         release_controls = QHBoxLayout()
         self.release_tag = QLineEdit()
-        self.release_tag.setPlaceholderText("tag, e.g. v3.0.0")
+        self.release_tag.setPlaceholderText("tag, e.g. v3.0.1")
         release_controls.addWidget(self.release_tag, 1)
         self.release_name = QLineEdit()
         self.release_name.setPlaceholderText("Release title")

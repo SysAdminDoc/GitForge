@@ -2,6 +2,10 @@
 
 All notable changes to GitForge will be documented in this file.
 
+## [v3.0.1] - 2026-08-09
+
+- Maintenance release with synchronized version metadata and verified test/build baselines.
+
 ## [v3.0.0] - 2026-08-03
 
 - Added a provider-agnostic repository API with GitLab, Gitea, Forgejo, and read-only Bitbucket Cloud adapters.
